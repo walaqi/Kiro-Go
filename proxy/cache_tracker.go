@@ -511,8 +511,16 @@ func billedClaudeInputTokens(inputTokens int, usage promptCacheUsage) int {
 }
 
 func buildClaudeUsageMap(inputTokens, outputTokens int, usage promptCacheUsage, includeCache bool) map[string]interface{} {
+	return buildClaudeUsageMapExplicit(billedClaudeInputTokens(inputTokens, usage), outputTokens, usage, includeCache)
+}
+
+// buildClaudeUsageMapExplicit builds the usage map using a pre-computed billed
+// input_tokens value instead of deriving it from the cache components. This is
+// used after credit calibration, where the cache_read / cache_creation counts
+// are rescaled but the reported input_tokens must remain fixed.
+func buildClaudeUsageMapExplicit(billedInput, outputTokens int, usage promptCacheUsage, includeCache bool) map[string]interface{} {
 	result := map[string]interface{}{
-		"input_tokens":  billedClaudeInputTokens(inputTokens, usage),
+		"input_tokens":  maxInt(billedInput, 0),
 		"output_tokens": outputTokens,
 	}
 	if !includeCache {
