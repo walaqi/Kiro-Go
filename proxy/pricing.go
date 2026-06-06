@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"math"
 	"strings"
+	"sync"
 
 	"kiro-go/config"
 	"kiro-go/logger"
@@ -21,21 +22,41 @@ type modelPricing struct {
 	CacheCreation1hInputTokenCost float64 `json:"cache_creation_input_token_cost_above_1hr"`
 }
 
+// modelPricingSeed is the embedded fallback pricing table. The authoritative
+// copy lives on disk at data/model_pricing.json and is refreshed periodically
+// by the background updater (see pricing_updater.go). The seed is used when no
+// on-disk copy exists yet — e.g. on a fresh deployment before the first fetch
+// succeeds — so calibration still works out of the box.
+//
 //go:embed model_pricing.json
-var modelPricingRaw []byte
+var modelPricingSeed []byte
 
-var modelPricingTable = loadModelPricingTable()
+var (
+	modelPricingMu    sync.RWMutex
+	modelPricingTable = parseModelPricingTable(modelPricingSeed)
+)
 
-func loadModelPricingTable() map[string]modelPricing {
+// parseModelPricingTable unmarshals a raw model_pricing.json document into the
+// calibration table. On parse failure it returns an empty table so calibration
+// degrades to a no-op rather than crashing the proxy.
+func parseModelPricingTable(raw []byte) map[string]modelPricing {
 	table := make(map[string]modelPricing)
-	if err := json.Unmarshal(modelPricingRaw, &table); err != nil {
-		// Embedded data is generated at build time; a parse failure means the
-		// embedded file is malformed. Fall back to an empty table so calibration
-		// degrades to a no-op rather than crashing the proxy.
-		logger.Errorf("failed to parse embedded model_pricing.json: %v", err)
+	if err := json.Unmarshal(raw, &table); err != nil {
+		logger.Errorf("failed to parse model_pricing.json: %v", err)
 		return map[string]modelPricing{}
 	}
 	return table
+}
+
+// setModelPricingTable atomically replaces the active pricing table. It is
+// called by the background updater after a successful fetch and remap.
+func setModelPricingTable(table map[string]modelPricing) {
+	if table == nil {
+		return
+	}
+	modelPricingMu.Lock()
+	modelPricingTable = table
+	modelPricingMu.Unlock()
 }
 
 // lookupModelPricing resolves a model name (in the proxy's internal dot form,
@@ -43,8 +64,11 @@ func loadModelPricingTable() map[string]modelPricing {
 // name to the dash form used as keys in the pricing table and falls back to the
 // configured model aliases when there is no direct hit.
 func lookupModelPricing(model string) (modelPricing, bool) {
+	modelPricingMu.RLock()
+	table := modelPricingTable
+	modelPricingMu.RUnlock()
 	for _, candidate := range pricingLookupCandidates(model) {
-		if p, ok := modelPricingTable[candidate]; ok {
+		if p, ok := table[candidate]; ok {
 			return p, true
 		}
 	}
