@@ -1243,12 +1243,19 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		}
 
 		ensureMessageStart()
+		// Calibrate the reported output / cache token counts against published
+		// model list prices so their total list-price cost matches the dollar
+		// value implied by the upstream credits (now available via OnCredits).
+		// The billed input_tokens is held fixed to avoid disturbing client
+		// compaction signals.
+		billedInput := billedClaudeInputTokens(inputTokens, cacheUsage)
+		reportOutput, reportUsage, _ := calibrateScaledUsage(model, credits, billedInput, outputTokens, cacheUsage)
 		h.sendSSE(w, flusher, "message_delta", map[string]interface{}{
 			"type": "message_delta",
 			"delta": map[string]interface{}{
 				"stop_reason": stopReason,
 			},
-			"usage": buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, cacheProfile != nil),
+			"usage": buildClaudeUsageMapExplicit(billedInput, reportOutput, reportUsage, cacheProfile != nil),
 		})
 
 		h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
@@ -1435,14 +1442,22 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			}
 		}
 
-		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model)
-		resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, cacheUsage)
-		resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
-		resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens
+		// Calibrate the reported output / cache token counts against published
+		// model list prices so that their total list-price cost matches the
+		// dollar value implied by the upstream credits. The billed input_tokens
+		// is held fixed to avoid disturbing client compaction signals.
+		billedInput := billedClaudeInputTokens(inputTokens, cacheUsage)
+		reportOutput, reportUsage, _ := calibrateScaledUsage(model, credits, billedInput, outputTokens, cacheUsage)
+
+		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, reportOutput, model)
+		resp.Usage.InputTokens = billedInput
+		resp.Usage.OutputTokens = reportOutput
+		resp.Usage.CacheCreationInputTokens = reportUsage.CacheCreationInputTokens
+		resp.Usage.CacheReadInputTokens = reportUsage.CacheReadInputTokens
 		if cacheProfile != nil {
 			resp.Usage.CacheCreation = &ClaudeCacheCreationUsage{
-				Ephemeral5mInputTokens: cacheUsage.CacheCreation5mInputTokens,
-				Ephemeral1hInputTokens: cacheUsage.CacheCreation1hInputTokens,
+				Ephemeral5mInputTokens: reportUsage.CacheCreation5mInputTokens,
+				Ephemeral1hInputTokens: reportUsage.CacheCreation1hInputTokens,
 			}
 		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")

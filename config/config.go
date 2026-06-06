@@ -174,6 +174,14 @@ type Config struct {
 	// solely because usageCurrent >= usageLimit.
 	AllowOverUsage bool `json:"allowOverUsage,omitempty"`
 
+	// CreditsToUSD is the conversion constant from upstream Kiro credits to USD,
+	// used to calibrate the reported output / cache_read / cache_creation token
+	// counts against published model list prices. The target dollar amount for a
+	// request is credits * CreditsToUSD. A value <= 0 falls back to the default
+	// (see GetCreditsToUSD). This only affects the usage numbers reported to
+	// clients; it does not change credit accounting or persisted statistics.
+	CreditsToUSD float64 `json:"creditsToUSD,omitempty"`
+
 	// Proxy configuration: optional outbound proxy for Kiro API requests
 	// Format: "socks5://host:port", "socks5://user:pass@host:port",
 	//         "http://host:port",  "http://user:pass@host:port"
@@ -233,6 +241,10 @@ type AccountInfo struct {
 
 // Version current version
 const Version = "1.1.2"
+
+// defaultCreditsToUSD is the fallback conversion constant from upstream Kiro
+// credits to USD, used when CreditsToUSD is unset or non-positive.
+const defaultCreditsToUSD = 0.2
 
 var (
 	cfg     *Config
@@ -834,6 +846,26 @@ func UpdateAllowOverUsage(allow bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.AllowOverUsage = allow
+	return Save()
+}
+
+// GetCreditsToUSD returns the conversion constant used to translate upstream
+// credits into a target USD amount for usage calibration. Defaults to 0.2 when
+// unset (0 or negative values fall back to the default).
+func GetCreditsToUSD() float64 {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.CreditsToUSD <= 0 {
+		return defaultCreditsToUSD
+	}
+	return cfg.CreditsToUSD
+}
+
+// UpdateCreditsToUSD updates the credits-to-USD conversion constant and persists it.
+func UpdateCreditsToUSD(v float64) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.CreditsToUSD = v
 	return Save()
 }
 
