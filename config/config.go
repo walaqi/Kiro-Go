@@ -143,6 +143,33 @@ type ApiKeyEntry struct {
 	RequestsCount int64   `json:"requestsCount,omitempty"`
 }
 
+// PricingConfig holds the upstream source URLs for the model pricing table used
+// by credit-to-USD usage calibration. When a URL is empty the background updater
+// falls back to its built-in default (see DefaultPricingHashURL / DefaultPricingURL).
+type PricingConfig struct {
+	HashURL    string `json:"hash_url,omitempty"`    // URL of the upstream sha256 of the pricing document
+	PricingURL string `json:"pricing_url,omitempty"` // URL of the upstream pricing JSON document
+}
+
+// DefaultPricingHashURL and DefaultPricingURL are the built-in upstream sources
+// for the model pricing table. They are written into a freshly created config on
+// cold start and serve as the fallback when the pricing URLs are left empty.
+// The gh-proxy.org prefix fronts raw.githubusercontent.com for reachability in
+// regions where the bare GitHub raw host is blocked.
+const (
+	DefaultPricingHashURL = "https://raw.githubusercontent.com/walaqi/model-price-repo/refs/heads/main/model_prices_and_context_window.sha256"
+	DefaultPricingURL     = "https://raw.githubusercontent.com/walaqi/model-price-repo/refs/heads/main/model_prices_and_context_window.json"
+)
+
+// defaultPricingConfig returns a PricingConfig populated with the built-in
+// upstream sources.
+func defaultPricingConfig() *PricingConfig {
+	return &PricingConfig{
+		HashURL:    DefaultPricingHashURL,
+		PricingURL: DefaultPricingURL,
+	}
+}
+
 // Config represents the global application configuration.
 type Config struct {
 	// Server settings
@@ -181,6 +208,12 @@ type Config struct {
 	// (see GetCreditsToUSD). This only affects the usage numbers reported to
 	// clients; it does not change credit accounting or persisted statistics.
 	CreditsToUSD float64 `json:"creditsToUSD,omitempty"`
+
+	// Pricing configures the source URLs for the background pricing-table updater
+	// (see proxy/pricing_updater.go). When unset, the updater falls back to its
+	// built-in default URLs. Useful for pointing at a mirror/proxy of the
+	// upstream pricing document.
+	Pricing *PricingConfig `json:"pricing,omitempty"`
 
 	// Proxy configuration: optional outbound proxy for Kiro API requests
 	// Format: "socks5://host:port", "socks5://user:pass@host:port",
@@ -274,6 +307,7 @@ func Load() error {
 				Host:          "0.0.0.0",
 				RequireApiKey: false,
 				Accounts:      []Account{},
+				Pricing:       defaultPricingConfig(),
 			}
 			return saveLocked()
 		}
@@ -861,12 +895,25 @@ func GetCreditsToUSD() float64 {
 	return cfg.CreditsToUSD
 }
 
-// UpdateCreditsToUSD updates the credits-to-USD conversion constant and persists it.
-func UpdateCreditsToUSD(v float64) error {
-	cfgLock.Lock()
-	defer cfgLock.Unlock()
-	cfg.CreditsToUSD = v
-	return Save()
+// GetPricingURLs returns the upstream source URLs for the model pricing table
+// (hash URL and pricing JSON URL). Cold-start configs are seeded with the
+// built-in defaults; for older configs that predate the pricing block (or have
+// an individual URL blank), each missing value falls back to its built-in
+// default so the background updater always has a working source.
+func GetPricingURLs() (hashURL, pricingURL string) {
+	cfgLock.RLock()
+	if cfg != nil && cfg.Pricing != nil {
+		hashURL = cfg.Pricing.HashURL
+		pricingURL = cfg.Pricing.PricingURL
+	}
+	cfgLock.RUnlock()
+	if hashURL == "" {
+		hashURL = DefaultPricingHashURL
+	}
+	if pricingURL == "" {
+		pricingURL = DefaultPricingURL
+	}
+	return hashURL, pricingURL
 }
 
 // GetLogLevel returns the configured log level (debug/info/warn/error). Defaults to "info".

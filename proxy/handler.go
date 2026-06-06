@@ -232,6 +232,8 @@ func NewHandler() *Handler {
 	go h.backgroundStatsSaver()
 	// 清理过期的 stored responses（>30 天）
 	go purgeExpiredResponses(responsesDefaultTTL)
+	// 加载并定时更新模型定价表（用于 credit→USD 校准）
+	startPricingUpdater(h.stopRefresh)
 	return h
 }
 
