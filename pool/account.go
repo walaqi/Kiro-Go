@@ -381,6 +381,22 @@ func (p *AccountPool) MarkOverLimit(id string) {
 	p.Reload()
 }
 
+// UpdateProfileArn updates the ProfileArn for the given account in the pool's
+// in-memory slice. Called after ResolveProfileArn succeeds so subsequent
+// requests reuse the cached value without re-resolving.
+func (p *AccountPool) UpdateProfileArn(id, profileArn string) {
+	if profileArn == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i := range p.accounts {
+		if p.accounts[i].ID == id {
+			p.accounts[i].ProfileArn = profileArn
+		}
+	}
+}
+
 // UpdateToken 更新账号 Token
 func (p *AccountPool) UpdateToken(id, accessToken, refreshToken string, expiresAt int64) {
 	p.mu.Lock()

@@ -1420,7 +1420,7 @@
     const d = await res.json();
     $('requireApiKey').checked = d.requireApiKey;
     $('allowOverUsage').checked = d.allowOverUsage || false;
-    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys()]);
+    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys(), loadCostConfig()]);
     refreshCustomSelects();
   }
   async function loadThinkingConfig() {
@@ -1527,6 +1527,19 @@
     const allowOverUsage = $('allowOverUsage').checked;
     await api('/settings', { method: 'POST', body: JSON.stringify({ allowOverUsage }) });
     toast(t('settings.overUsageSaved'), 'success');
+  }
+  async function loadCostConfig() {
+    const res = await api('/settings');
+    const d = await res.json();
+    $('creditsToUSDInput').value = d.creditsToUSD || 0.2;
+  }
+  async function saveCostConfig() {
+    const val = parseFloat($('creditsToUSDInput').value);
+    if (isNaN(val) || val <= 0) { toast(t('settings.creditsToUSDRequired'), 'warning'); return; }
+    const res = await api('/settings', { method: 'POST', body: JSON.stringify({ creditsToUSD: val }) });
+    const d = await res.json();
+    if (d.success) toast(t('settings.costSaved'), 'success');
+    else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
   }
   async function changePassword() {
     const np = $('newPassword').value;
@@ -2674,6 +2687,7 @@
   function bindSettingsEvents() {
     $('saveRequireApiKeyBtn').addEventListener('click', saveRequireApiKey);
     $('saveOverUsageBtn').addEventListener('click', saveOverUsageConfig);
+    $('saveCostBtn').addEventListener('click', saveCostConfig);
     $('saveThinkingBtn').addEventListener('click', saveThinkingConfig);
     $('saveEndpointBtn').addEventListener('click', saveEndpointConfig);
     $('changePasswordBtn').addEventListener('click', changePassword);
