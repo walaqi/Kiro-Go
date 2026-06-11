@@ -18,7 +18,7 @@
   let filterKeyword = '';
   let filterStatus = 'all';
   let privacyModeEnabled = true;
-  let promptRules = [];
+  let filterConfig = { systemInjection: { enabled: false, position: 'prepend', text: '' }, systemReplaceRules: [], toolDescReplaceRules: [] };
   let builderIdSession = '';
   let builderIdPollTimer = null;
   let iamSession = '';
@@ -1420,7 +1420,7 @@
     const d = await res.json();
     $('requireApiKey').checked = d.requireApiKey;
     $('allowOverUsage').checked = d.allowOverUsage || false;
-    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys(), loadCostConfig()]);
+    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadFilterConfig(), loadApiKeys(), loadCostConfig()]);
     refreshCustomSelects();
   }
   async function loadThinkingConfig() {
@@ -1851,66 +1851,84 @@
     bindDialogBackdropClose('apiKeyShowModal', closeShowApiKeyModal);
   }
 
-  // Prompt filter rules
-  async function loadPromptFilter() {
-    const res = await api('/prompt-filter');
+  // Filter tab
+  async function loadFilterConfig() {
+    const res = await api('/filter');
     const d = await res.json();
-    $('filterClaudeCode').checked = !!d.filterClaudeCode;
-    $('filterEnvNoise').checked = !!d.filterEnvNoise;
-    $('filterStripBoundaries').checked = !!d.filterStripBoundaries;
-    promptRules = d.rules || [];
-    renderPromptRules();
+    filterConfig = {
+      systemInjection: d.systemInjection || { enabled: false, position: 'prepend', text: '' },
+      systemReplaceRules: d.systemReplaceRules || [],
+      toolDescReplaceRules: d.toolDescReplaceRules || []
+    };
+    renderFilterTab();
   }
-  async function savePromptFilter() {
-    const res = await api('/prompt-filter', {
-      method: 'POST', body: JSON.stringify({
-        filterClaudeCode: $('filterClaudeCode').checked,
-        filterEnvNoise: $('filterEnvNoise').checked,
-        filterStripBoundaries: $('filterStripBoundaries').checked,
-        rules: promptRules
-      })
-    });
+  async function saveFilterConfig() {
+    filterConfig.systemInjection.enabled = $('filterInjectionEnabled').checked;
+    filterConfig.systemInjection.position = document.querySelector('input[name="filterInjectionPos"]:checked').value;
+    filterConfig.systemInjection.text = $('filterInjectionText').value;
+    const res = await api('/filter', { method: 'POST', body: JSON.stringify(filterConfig) });
     const d = await res.json();
-    if (d.success) toast(t('settings.promptFilterSaved'), 'success');
+    if (d.success) toast(t('filter.saved'), 'success');
     else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
   }
-  function renderPromptRules() {
-    const c = $('promptFilterRules');
+  function renderFilterTab() {
+    $('filterInjectionEnabled').checked = !!filterConfig.systemInjection.enabled;
+    $('filterInjectionText').value = filterConfig.systemInjection.text || '';
+    const pos = filterConfig.systemInjection.position || 'prepend';
+    const radios = document.querySelectorAll('input[name="filterInjectionPos"]');
+    radios.forEach(r => { r.checked = r.value === pos; });
+    renderSystemReplaceRules();
+    renderToolDescReplaceRules();
+  }
+  function renderSystemReplaceRules() {
+    const c = $('systemReplaceRules');
     if (!c) return;
-    if (!promptRules.length) {
-      c.innerHTML = '<small class="text-xs muted-text">' + escapeHtml(t('promptFilter.noRules')) + '</small>';
+    const rules = filterConfig.systemReplaceRules;
+    if (!rules.length) {
+      c.innerHTML = '<small class="text-xs muted-text">' + escapeHtml(t('filter.noRules')) + '</small>';
       return;
     }
-    c.innerHTML = promptRules.map((r, i) => {
-      const isContains = r.type === 'lines-containing';
-      const typeLabel = isContains ? t('promptFilter.typeContains') : t('promptFilter.typeRegex');
-      const matchPh = isContains ? t('promptFilter.matchPlaceholderContains') : t('promptFilter.matchPlaceholderRegex');
-      const replaceRow = !isContains
-        ? '<div class="rule-field"><label>' + escapeHtml(t('promptFilter.replace')) + '</label>' +
-        '<input value="' + escapeAttr(r.replace || '') + '" data-rule-idx="' + i + '" data-rule-field="replace" placeholder="' + escapeAttr(t('promptFilter.emptyRemove')) + '" />' +
-        '</div>'
-        : '';
-      return '<div class="rule-card' + (r.enabled ? '' : ' disabled') + '">' +
-        '<div class="rule-header">' +
-        '<label class="switch"><input type="checkbox" ' + (r.enabled ? 'checked' : '') + ' data-rule-toggle="' + i + '" /><span class="slider"></span></label>' +
-        '<div class="rule-meta">' +
-        '<input class="rule-name-input" value="' + escapeAttr(r.name || '') + '" data-rule-idx="' + i + '" data-rule-field="name" placeholder="' + escapeAttr(t('promptFilter.unnamed')) + '" />' +
-        '<span class="rule-type">' + escapeHtml(typeLabel) + '</span>' +
-        '</div>' +
-        '<button class="rule-remove" data-rule-remove="' + i + '" type="button" aria-label="' + escapeAttr(t('common.remove')) + '">&times;</button>' +
-        '</div>' +
-        '<div class="rule-body">' +
-        '<div class="rule-field"><label>' + escapeHtml(t('promptFilter.match')) + '</label>' +
-        '<input value="' + escapeAttr(r.match || '') + '" data-rule-idx="' + i + '" data-rule-field="match" placeholder="' + escapeAttr(matchPh) + '" />' +
-        '</div>' +
-        replaceRow +
-        '</div>' +
-        '</div>';
-    }).join('');
+    c.innerHTML = rules.map((r, i) =>
+      '<div class="rule-card' + (r.enabled ? '' : ' disabled') + '">' +
+      '<div class="rule-header">' +
+      '<label class="switch"><input type="checkbox" ' + (r.enabled ? 'checked' : '') + ' data-sr-toggle="' + i + '" /><span class="slider"></span></label>' +
+      '<div class="rule-meta"><input class="rule-name-input" value="' + escapeAttr(r.name || '') + '" data-sr-idx="' + i + '" data-sr-field="name" placeholder="' + escapeAttr(t('filter.unnamed')) + '" /></div>' +
+      '<button class="rule-remove" data-sr-remove="' + i + '" type="button" aria-label="' + escapeAttr(t('common.remove')) + '">&times;</button>' +
+      '</div>' +
+      '<div class="rule-body">' +
+      '<div class="rule-field"><label>' + escapeHtml(t('filter.match')) + '</label><input value="' + escapeAttr(r.match || '') + '" data-sr-idx="' + i + '" data-sr-field="match" /></div>' +
+      '<div class="rule-field"><label>' + escapeHtml(t('filter.replace')) + '</label><input value="' + escapeAttr(r.replace || '') + '" data-sr-idx="' + i + '" data-sr-field="replace" /></div>' +
+      '</div></div>'
+    ).join('');
   }
-  function addPromptRule(type) {
-    promptRules.push({ id: 'rule-' + Date.now(), name: '', type, match: '', replace: '', enabled: true });
-    renderPromptRules();
+  function renderToolDescReplaceRules() {
+    const c = $('toolDescReplaceRules');
+    if (!c) return;
+    const rules = filterConfig.toolDescReplaceRules;
+    if (!rules.length) {
+      c.innerHTML = '<small class="text-xs muted-text">' + escapeHtml(t('filter.noRules')) + '</small>';
+      return;
+    }
+    c.innerHTML = rules.map((r, i) =>
+      '<div class="rule-card' + (r.enabled ? '' : ' disabled') + '">' +
+      '<div class="rule-header">' +
+      '<label class="switch"><input type="checkbox" ' + (r.enabled ? 'checked' : '') + ' data-td-toggle="' + i + '" /><span class="slider"></span></label>' +
+      '<div class="rule-meta"><span class="rule-type">' + escapeHtml(r.toolName || '') + '</span></div>' +
+      '<button class="rule-remove" data-td-remove="' + i + '" type="button" aria-label="' + escapeAttr(t('common.remove')) + '">&times;</button>' +
+      '</div>' +
+      '<div class="rule-body">' +
+      '<div class="rule-field"><label>' + escapeHtml(t('filter.toolName')) + '</label><input value="' + escapeAttr(r.toolName || '') + '" data-td-idx="' + i + '" data-td-field="toolName" /></div>' +
+      '<div class="rule-field"><label>' + escapeHtml(t('filter.description')) + '</label><textarea rows="2" data-td-idx="' + i + '" data-td-field="description">' + escapeHtml(r.description || '') + '</textarea></div>' +
+      '</div></div>'
+    ).join('');
+  }
+  function addSystemReplaceRule() {
+    filterConfig.systemReplaceRules.push({ id: 'sr-' + Date.now(), name: '', match: '', replace: '', enabled: true });
+    renderSystemReplaceRules();
+  }
+  function addToolDescReplaceRule() {
+    filterConfig.toolDescReplaceRules.push({ id: 'td-' + Date.now(), toolName: '', description: '', enabled: true });
+    renderToolDescReplaceRules();
   }
 
   // Add-account modal templates
@@ -2697,25 +2715,41 @@
     bindApiKeyEvents();
   }
 
-  function bindPromptFilterEvents() {
-    $('savePromptFilterBtn').addEventListener('click', savePromptFilter);
-    $('addRuleRegexBtn').addEventListener('click', () => addPromptRule('regex'));
-    $('addRuleContainsBtn').addEventListener('click', () => addPromptRule('lines-containing'));
+  function bindFilterEvents() {
+    $('saveFilterBtn').addEventListener('click', saveFilterConfig);
+    $('addSystemReplaceBtn').addEventListener('click', addSystemReplaceRule);
+    $('addToolDescRuleBtn').addEventListener('click', addToolDescReplaceRule);
 
-    $('promptFilterRules').addEventListener('input', e => {
-      const idx = e.target.dataset.ruleIdx;
-      const field = e.target.dataset.ruleField;
-      if (idx != null && field) promptRules[idx][field] = e.target.value;
+    $('systemReplaceRules').addEventListener('input', e => {
+      const idx = e.target.dataset.srIdx;
+      const field = e.target.dataset.srField;
+      if (idx != null && field) filterConfig.systemReplaceRules[idx][field] = e.target.value;
     });
-    $('promptFilterRules').addEventListener('change', e => {
-      if (e.target.dataset.ruleToggle != null) {
-        promptRules[e.target.dataset.ruleToggle].enabled = e.target.checked;
-        renderPromptRules();
+    $('systemReplaceRules').addEventListener('change', e => {
+      if (e.target.dataset.srToggle != null) {
+        filterConfig.systemReplaceRules[e.target.dataset.srToggle].enabled = e.target.checked;
+        renderSystemReplaceRules();
       }
     });
-    $('promptFilterRules').addEventListener('click', e => {
-      const rm = e.target.closest('[data-rule-remove]');
-      if (rm) { promptRules.splice(parseInt(rm.dataset.ruleRemove, 10), 1); renderPromptRules(); }
+    $('systemReplaceRules').addEventListener('click', e => {
+      const rm = e.target.closest('[data-sr-remove]');
+      if (rm) { filterConfig.systemReplaceRules.splice(parseInt(rm.dataset.srRemove, 10), 1); renderSystemReplaceRules(); }
+    });
+
+    $('toolDescReplaceRules').addEventListener('input', e => {
+      const idx = e.target.dataset.tdIdx;
+      const field = e.target.dataset.tdField;
+      if (idx != null && field) filterConfig.toolDescReplaceRules[idx][field] = e.target.value;
+    });
+    $('toolDescReplaceRules').addEventListener('change', e => {
+      if (e.target.dataset.tdToggle != null) {
+        filterConfig.toolDescReplaceRules[e.target.dataset.tdToggle].enabled = e.target.checked;
+        renderToolDescReplaceRules();
+      }
+    });
+    $('toolDescReplaceRules').addEventListener('click', e => {
+      const rm = e.target.closest('[data-td-remove]');
+      if (rm) { filterConfig.toolDescReplaceRules.splice(parseInt(rm.dataset.tdRemove, 10), 1); renderToolDescReplaceRules(); }
     });
   }
 
@@ -2782,7 +2816,7 @@
     bindShellEvents();
     bindAccountEvents();
     bindSettingsEvents();
-    bindPromptFilterEvents();
+    bindFilterEvents();
     bindModalEvents();
     bindDetailEvents();
     bindTestEvents();

@@ -109,16 +109,41 @@ type Account struct {
 	TotalCredits float64 `json:"totalCredits,omitempty"` // Cumulative credits consumed
 }
 
-// PromptFilterRule defines a single custom prompt sanitization rule.
-// Type can be: "regex" (regexp find/replace within prompt) or
-// "lines-containing" (remove lines containing the match substring).
-type PromptFilterRule struct {
-	ID      string `json:"id"`                // Unique rule identifier
-	Name    string `json:"name"`              // Human-readable rule name
-	Type    string `json:"type"`              // "regex" or "lines-containing"
-	Match   string `json:"match"`             // Pattern to match (regex pattern or substring)
-	Replace string `json:"replace,omitempty"` // Replacement string (only for regex; empty = delete match)
-	Enabled bool   `json:"enabled"`           // Whether this rule is active
+// SystemPromptInjection appends or prepends a fixed text block to the Claude
+// system prompt. Applied as step 1 of the filter pipeline.
+type SystemPromptInjection struct {
+	Enabled  bool   `json:"enabled"`
+	Position string `json:"position"` // "prepend" or "append"
+	Text     string `json:"text"`
+}
+
+// SystemPromptReplaceRule is a plain-string find/replace applied to the Claude
+// system prompt. Rules are applied in list order. An empty Replace deletes the
+// match. Applied as step 2 of the filter pipeline.
+type SystemPromptReplaceRule struct {
+	ID      string `json:"id"`
+	Name    string `json:"name,omitempty"`
+	Match   string `json:"match"`
+	Replace string `json:"replace,omitempty"`
+	Enabled bool   `json:"enabled"`
+}
+
+// ToolDescReplaceRule wholly replaces a Claude tool's description, matched by
+// the tool's original name (exact match). Applied as step 3 of the filter
+// pipeline.
+type ToolDescReplaceRule struct {
+	ID          string `json:"id"`
+	ToolName    string `json:"toolName"`
+	Description string `json:"description"`
+	Enabled     bool   `json:"enabled"`
+}
+
+// FilterConfig groups all Claude-path filter settings exposed via the admin
+// "过滤" tab.
+type FilterConfig struct {
+	SystemInjection      SystemPromptInjection     `json:"systemInjection"`
+	SystemReplaceRules   []SystemPromptReplaceRule `json:"systemReplaceRules"`
+	ToolDescReplaceRules []ToolDescReplaceRule     `json:"toolDescReplaceRules"`
 }
 
 // ApiKeyEntry represents a single API key with optional usage limits and counters.
@@ -221,23 +246,9 @@ type Config struct {
 	// Leave empty to connect directly.
 	ProxyURL string `json:"proxyURL,omitempty"`
 
-	// SanitizeClaudeCodePrompt is kept for backward-compatible JSON loading only.
-	// Migrated to FilterClaudeCode on first load. Do not use directly.
-	SanitizeClaudeCodePrompt bool `json:"sanitizeClaudeCodePrompt,omitempty"`
-
-	// FilterClaudeCode detects the Claude Code CLI built-in system prompt and replaces it
-	// with a compact backend-only prompt, reducing token usage significantly.
-	FilterClaudeCode bool `json:"filterClaudeCode,omitempty"`
-
-	// FilterEnvNoise strips environment metadata lines from system prompts:
-	// git status, recent commits, environment sections, fast_mode_info tags, etc.
-	FilterEnvNoise bool `json:"filterEnvNoise,omitempty"`
-
-	// FilterStripBoundaries removes --- SYSTEM PROMPT --- / --- END SYSTEM PROMPT --- markers.
-	FilterStripBoundaries bool `json:"filterStripBoundaries,omitempty"`
-
-	// PromptFilterRules is a list of user-defined prompt sanitization rules (regex or line-filter).
-	PromptFilterRules []PromptFilterRule `json:"promptFilterRules,omitempty"`
+	// Filter holds Claude-path system-prompt and tool-description rewrite rules,
+	// configured from the admin "过滤" tab.
+	Filter *FilterConfig `json:"filter,omitempty"`
 
 	// LogLevel controls verbosity of application logs.
 	// Accepted values: "debug", "info", "warn", "error". Defaults to "info".
@@ -688,87 +699,40 @@ func UpdateAccountInfo(id string, info AccountInfo) error {
 	return nil
 }
 
-// GetFilterClaudeCode returns whether Claude Code system prompt detection is enabled.
-// Also checks the legacy SanitizeClaudeCodePrompt flag for backward compatibility.
-func GetFilterClaudeCode() bool {
+// GetFilterConfig returns a deep copy of the current filter configuration.
+func GetFilterConfig() FilterConfig {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
-	if cfg == nil {
-		return false
+	if cfg == nil || cfg.Filter == nil {
+		return FilterConfig{
+			SystemReplaceRules:   []SystemPromptReplaceRule{},
+			ToolDescReplaceRules: []ToolDescReplaceRule{},
+		}
 	}
-	return cfg.FilterClaudeCode || cfg.SanitizeClaudeCodePrompt
+	out := FilterConfig{SystemInjection: cfg.Filter.SystemInjection}
+	out.SystemReplaceRules = append([]SystemPromptReplaceRule(nil), cfg.Filter.SystemReplaceRules...)
+	out.ToolDescReplaceRules = append([]ToolDescReplaceRule(nil), cfg.Filter.ToolDescReplaceRules...)
+	if out.SystemReplaceRules == nil {
+		out.SystemReplaceRules = []SystemPromptReplaceRule{}
+	}
+	if out.ToolDescReplaceRules == nil {
+		out.ToolDescReplaceRules = []ToolDescReplaceRule{}
+	}
+	return out
 }
 
-// GetFilterEnvNoise returns whether environment noise line stripping is enabled.
-func GetFilterEnvNoise() bool {
-	cfgLock.RLock()
-	defer cfgLock.RUnlock()
-	if cfg == nil {
-		return false
-	}
-	return cfg.FilterEnvNoise
-}
-
-// GetFilterStripBoundaries returns whether boundary marker stripping is enabled.
-func GetFilterStripBoundaries() bool {
-	cfgLock.RLock()
-	defer cfgLock.RUnlock()
-	if cfg == nil {
-		return false
-	}
-	return cfg.FilterStripBoundaries
-}
-
-// PromptFilterConfig holds all prompt filter settings for API responses.
-type PromptFilterConfig struct {
-	FilterClaudeCode      bool               `json:"filterClaudeCode"`
-	FilterEnvNoise        bool               `json:"filterEnvNoise"`
-	FilterStripBoundaries bool               `json:"filterStripBoundaries"`
-	Rules                 []PromptFilterRule `json:"rules"`
-}
-
-// GetPromptFilterConfig returns all prompt filter settings.
-func GetPromptFilterConfig() PromptFilterConfig {
-	cfgLock.RLock()
-	defer cfgLock.RUnlock()
-	if cfg == nil {
-		return PromptFilterConfig{Rules: []PromptFilterRule{}}
-	}
-	rules := make([]PromptFilterRule, len(cfg.PromptFilterRules))
-	copy(rules, cfg.PromptFilterRules)
-	return PromptFilterConfig{
-		FilterClaudeCode:      cfg.FilterClaudeCode || cfg.SanitizeClaudeCodePrompt,
-		FilterEnvNoise:        cfg.FilterEnvNoise,
-		FilterStripBoundaries: cfg.FilterStripBoundaries,
-		Rules:                 rules,
-	}
-}
-
-// UpdatePromptFilterConfig saves all prompt filter settings atomically.
-func UpdatePromptFilterConfig(filterClaudeCode, filterEnvNoise, filterStripBoundaries bool, rules []PromptFilterRule) error {
+// UpdateFilterConfig saves the filter configuration atomically.
+func UpdateFilterConfig(fc FilterConfig) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
-	cfg.FilterClaudeCode = filterClaudeCode
-	cfg.FilterEnvNoise = filterEnvNoise
-	cfg.FilterStripBoundaries = filterStripBoundaries
-	// Clear legacy flag to avoid double-applying after first save
-	cfg.SanitizeClaudeCodePrompt = false
-	if rules != nil {
-		cfg.PromptFilterRules = rules
-	}
-	return Save()
-}
-
-// GetPromptFilterRules returns the current prompt filter rules.
-func GetPromptFilterRules() []PromptFilterRule {
-	cfgLock.RLock()
-	defer cfgLock.RUnlock()
 	if cfg == nil {
-		return nil
+		return fmt.Errorf("config not initialized")
 	}
-	rules := make([]PromptFilterRule, len(cfg.PromptFilterRules))
-	copy(rules, cfg.PromptFilterRules)
-	return rules
+	stored := FilterConfig{SystemInjection: fc.SystemInjection}
+	stored.SystemReplaceRules = append([]SystemPromptReplaceRule(nil), fc.SystemReplaceRules...)
+	stored.ToolDescReplaceRules = append([]ToolDescReplaceRule(nil), fc.ToolDescReplaceRules...)
+	cfg.Filter = &stored
+	return Save()
 }
 
 // ThinkingConfig holds settings for AI thinking/reasoning mode.
