@@ -2149,10 +2149,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetProxy(w, r)
 	case path == "/proxy" && r.Method == "POST":
 		h.apiUpdateProxy(w, r)
-	case path == "/prompt-filter" && r.Method == "GET":
-		h.apiGetPromptFilter(w, r)
-	case path == "/prompt-filter" && r.Method == "POST":
-		h.apiUpdatePromptFilter(w, r)
+	case path == "/filter" && r.Method == "GET":
+		h.apiGetFilter(w, r)
+	case path == "/filter" && r.Method == "POST":
+		h.apiUpdateFilter(w, r)
 	case path == "/version" && r.Method == "GET":
 		h.apiGetVersion(w, r)
 	case path == "/export" && r.Method == "POST":
@@ -2919,42 +2919,18 @@ func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (h *Handler) apiGetPromptFilter(w http.ResponseWriter, r *http.Request) {
-	json.NewEncoder(w).Encode(config.GetPromptFilterConfig())
+func (h *Handler) apiGetFilter(w http.ResponseWriter, r *http.Request) {
+	json.NewEncoder(w).Encode(config.GetFilterConfig())
 }
 
-func (h *Handler) apiUpdatePromptFilter(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		FilterClaudeCode      *bool                      `json:"filterClaudeCode,omitempty"`
-		FilterEnvNoise        *bool                      `json:"filterEnvNoise,omitempty"`
-		FilterStripBoundaries *bool                      `json:"filterStripBoundaries,omitempty"`
-		Rules                 *[]config.PromptFilterRule `json:"rules,omitempty"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+func (h *Handler) apiUpdateFilter(w http.ResponseWriter, r *http.Request) {
+	var fc config.FilterConfig
+	if err := json.NewDecoder(r.Body).Decode(&fc); err != nil {
 		w.WriteHeader(400)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
 		return
 	}
-
-	// Read current config to fill in any fields not provided in the request.
-	current := config.GetPromptFilterConfig()
-	fcc := current.FilterClaudeCode
-	fen := current.FilterEnvNoise
-	fsb := current.FilterStripBoundaries
-	rules := current.Rules
-	if req.FilterClaudeCode != nil {
-		fcc = *req.FilterClaudeCode
-	}
-	if req.FilterEnvNoise != nil {
-		fen = *req.FilterEnvNoise
-	}
-	if req.FilterStripBoundaries != nil {
-		fsb = *req.FilterStripBoundaries
-	}
-	if req.Rules != nil {
-		rules = *req.Rules
-	}
-	if err := config.UpdatePromptFilterConfig(fcc, fen, fsb, rules); err != nil {
+	if err := config.UpdateFilterConfig(fc); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return

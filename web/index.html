@@ -107,6 +107,8 @@
                 data-i18n="tabs.settings"></span></button>
             <button type="button" class="tab" data-tab="api"><i class="fa-solid fa-plug tab-icon"></i><span
                 data-i18n="tabs.api"></span></button>
+            <button type="button" class="tab" data-tab="filter"><i class="fa-solid fa-filter tab-icon"></i><span
+                data-i18n="tabs.filter"></span></button>
           </div>
         </nav>
         <div class="topbar-actions flex-wrap justify-end">
@@ -374,50 +376,6 @@
           <button class="btn btn-primary" id="saveProxyBtn" data-i18n="settings.saveProxy"></button>
         </div>
 
-        <!-- Prompt filter -->
-        <div class="card">
-          <div class="card-header"><span class="card-title" data-i18n="settings.promptFilter"></span></div>
-          <div class="form-group">
-            <label class="font-semibold pb-2 block" data-i18n="settings.builtinFilters"></label>
-            <div class="flex flex-col gap-3">
-              <div>
-                <label class="flex items-center gap-2">
-                  <span class="switch"><input type="checkbox" id="filterClaudeCode" /><span
-                      class="slider"></span></span>
-                  <span data-i18n="settings.filterClaudeCode"></span>
-                </label>
-                <small class="field-hint-offset" data-i18n="settings.filterClaudeCodeHint"></small>
-              </div>
-              <div>
-                <label class="flex items-center gap-2">
-                  <span class="switch"><input type="checkbox" id="filterEnvNoise" /><span class="slider"></span></span>
-                  <span data-i18n="settings.filterEnvNoise"></span>
-                </label>
-                <small class="field-hint-offset" data-i18n="settings.filterEnvNoiseHint"></small>
-              </div>
-              <div>
-                <label class="flex items-center gap-2">
-                  <span class="switch"><input type="checkbox" id="filterStripBoundaries" /><span
-                      class="slider"></span></span>
-                  <span data-i18n="settings.filterStripBoundaries"></span>
-                </label>
-                <small class="field-hint-offset" data-i18n="settings.filterStripBoundariesHint"></small>
-              </div>
-            </div>
-          </div>
-          <div class="form-group mt-4">
-            <label class="font-semibold pb-2 block" data-i18n="settings.customRules"></label>
-            <div id="promptFilterRules" class="mb-2"></div>
-            <div class="flex gap-2 flex-wrap items-center">
-              <button class="btn btn-outline btn-sm" id="addRuleRegexBtn" data-i18n="promptFilter.addRegex"></button>
-              <button class="btn btn-outline btn-sm" id="addRuleContainsBtn"
-                data-i18n="promptFilter.addContains"></button>
-              <button class="btn btn-primary btn-sm" id="savePromptFilterBtn"
-                data-i18n="settings.savePromptFilter"></button>
-            </div>
-          </div>
-        </div>
-
         <!-- Statistics reset -->
         <div class="card">
           <div class="card-header"><span class="card-title" data-i18n="settings.statistics"></span></div>
@@ -497,9 +455,57 @@
           <p class="api-hint"><i class="fa-solid fa-key"></i><span data-i18n="api.statsHint"></span></p>
         </section>
       </div>
-    </div>
 
-    <!-- Footer -->
+      <!-- Filter tab -->
+      <div id="tabFilter" class="tab-content hidden">
+        <!-- System prompt injection -->
+        <div class="card">
+          <div class="card-header"><span class="card-title" data-i18n="filter.systemInjection"></span></div>
+          <div class="form-group">
+            <label class="flex items-center gap-2 mb-2">
+              <span class="switch"><input type="checkbox" id="filterInjectionEnabled" /><span class="slider"></span></span>
+              <span data-i18n="filter.enabled"></span>
+            </label>
+            <div class="flex gap-4 mb-2">
+              <label class="flex items-center gap-1">
+                <input type="radio" name="filterInjectionPos" value="prepend" checked />
+                <span data-i18n="filter.prepend"></span>
+              </label>
+              <label class="flex items-center gap-1">
+                <input type="radio" name="filterInjectionPos" value="append" />
+                <span data-i18n="filter.append"></span>
+              </label>
+            </div>
+            <textarea id="filterInjectionText" class="input w-full" rows="4" data-i18n-placeholder="filter.injectionPlaceholder"></textarea>
+          </div>
+        </div>
+
+        <!-- System prompt string replacement -->
+        <div class="card">
+          <div class="card-header"><span class="card-title" data-i18n="filter.systemReplace"></span></div>
+          <div class="form-group">
+            <small class="muted-text block mb-2" data-i18n="filter.systemReplaceHint"></small>
+            <div id="systemReplaceRules" class="mb-2"></div>
+            <button class="btn btn-outline btn-sm" id="addSystemReplaceBtn" type="button" data-i18n="filter.addReplaceRule"></button>
+          </div>
+        </div>
+
+        <!-- Tool description replacement -->
+        <div class="card">
+          <div class="card-header"><span class="card-title" data-i18n="filter.toolDescReplace"></span></div>
+          <div class="form-group">
+            <small class="muted-text block mb-2" data-i18n="filter.toolDescReplaceHint"></small>
+            <div id="toolDescReplaceRules" class="mb-2"></div>
+            <button class="btn btn-outline btn-sm" id="addToolDescRuleBtn" type="button" data-i18n="filter.addToolRule"></button>
+          </div>
+        </div>
+
+        <!-- Save -->
+        <div class="flex justify-end mt-2">
+          <button class="btn btn-primary" id="saveFilterBtn" type="button" data-i18n="filter.save"></button>
+        </div>
+      </div>
+    </div>
     <footer class="app-footer" aria-label="" data-i18n-aria-label="aria.footer">
       <div class="app-footer-inner">
         <div class="footer-panel">
