@@ -895,6 +895,14 @@ func GetCreditsToUSD() float64 {
 	return cfg.CreditsToUSD
 }
 
+// UpdateCreditsToUSD sets the credit-to-USD conversion constant and persists the change.
+func UpdateCreditsToUSD(v float64) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.CreditsToUSD = v
+	return Save()
+}
+
 // GetPricingURLs returns the upstream source URLs for the model pricing table
 // (hash URL and pricing JSON URL). Cold-start configs are seeded with the
 // built-in defaults; for older configs that predate the pricing block (or have

@@ -2915,6 +2915,7 @@ func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 		"port":           config.GetPort(),
 		"host":           config.GetHost(),
 		"allowOverUsage": config.GetAllowOverUsage(),
+		"creditsToUSD":   config.GetCreditsToUSD(),
 	})
 }
 
@@ -2963,10 +2964,11 @@ func (h *Handler) apiUpdatePromptFilter(w http.ResponseWriter, r *http.Request) 
 
 func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ApiKey         *string `json:"apiKey,omitempty"`
-		RequireApiKey  *bool   `json:"requireApiKey,omitempty"`
-		Password       string  `json:"password,omitempty"`
-		AllowOverUsage *bool   `json:"allowOverUsage,omitempty"`
+		ApiKey         *string  `json:"apiKey,omitempty"`
+		RequireApiKey  *bool    `json:"requireApiKey,omitempty"`
+		Password       string   `json:"password,omitempty"`
+		AllowOverUsage *bool    `json:"allowOverUsage,omitempty"`
+		CreditsToUSD   *float64 `json:"creditsToUSD,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -2989,6 +2991,14 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		// Rebuild the pool so over-quota accounts are re-included or dropped immediately.
 		h.pool.Reload()
+	}
+
+	if req.CreditsToUSD != nil {
+		if err := config.UpdateCreditsToUSD(*req.CreditsToUSD); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
 	}
 
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})

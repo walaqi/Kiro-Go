@@ -67,12 +67,14 @@ func estimateClaudeRequestInputTokens(req *ClaudeRequest) int {
 }
 
 func estimateClaudeOutputTokens(content, thinkingContent string, toolUses []KiroToolUse) int {
-	total := estimateApproxTokens(content)
-	total += estimateApproxTokens(thinkingContent)
+	total := countOutputTokens(content)
+	total += countOutputTokens(thinkingContent)
 
 	for _, tu := range toolUses {
-		total += estimateApproxTokens(tu.Name)
-		total += estimateJSONTokens(tu.Input)
+		total += countOutputTokens(tu.Name)
+		if b, err := json.Marshal(tu.Input); err == nil {
+			total += countOutputTokens(string(b))
+		}
 	}
 
 	return total

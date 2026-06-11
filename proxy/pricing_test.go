@@ -68,6 +68,11 @@ func TestCalibrateScaledUsageHitsTarget(t *testing.T) {
 		t.Fatalf("expected calibration to apply")
 	}
 
+	// output is fixed — only cache fields are scaled.
+	if gotOutput != output {
+		t.Fatalf("output must not change: got %d, want %d", gotOutput, output)
+	}
+
 	// input_tokens is never passed into or mutated by the calibrator; the billed
 	// input used for cost must remain the same value we provided.
 	costAfter := totalListPriceCost(pricing, billedInput, gotOutput, gotUsage)
@@ -94,14 +99,15 @@ func TestCalibrateScaledUsageScaleDown(t *testing.T) {
 	output := 1000
 
 	// Small credits => target below the unscaled variable cost but still above
-	// the fixed input cost => scale in (0,1).
+	// the fixed cost => scale in (0,1).
 	credits := 0.1
 	gotOutput, gotUsage, applied := calibrateScaledUsage(model, credits, 500, output, usage)
 	if !applied {
 		t.Fatalf("expected calibration to apply for scale-down case")
 	}
-	if gotOutput >= output {
-		t.Fatalf("expected output to shrink, got %d (was %d)", gotOutput, output)
+	// output is now fixed — only cache fields are scaled.
+	if gotOutput != output {
+		t.Fatalf("output must not change: got %d, want %d", gotOutput, output)
 	}
 	if gotUsage.CacheReadInputTokens >= usage.CacheReadInputTokens {
 		t.Fatalf("expected cache_read to shrink, got %d (was %d)", gotUsage.CacheReadInputTokens, usage.CacheReadInputTokens)
