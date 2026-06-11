@@ -7,7 +7,6 @@ import (
 	"kiro-go/auth"
 	"kiro-go/config"
 	"kiro-go/logger"
-	"kiro-go/pool"
 	"net/http"
 	neturl "net/url"
 	"strings"
@@ -129,7 +128,6 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 			logger.Warnf("[ProfileArn] Failed to cache profile ARN for %s: %v", account.Email, updateErr)
 		}
 		account.ProfileArn = profileArn
-		pool.GetPool().UpdateProfileArn(account.ID, profileArn)
 		return profileArn, nil
 	}
 
@@ -141,7 +139,6 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 				logger.Warnf("[ProfileArn] Failed to cache profile ARN for %s: %v", account.Email, updateErr)
 			}
 			account.ProfileArn = refreshedArn
-			pool.GetPool().UpdateProfileArn(account.ID, refreshedArn)
 			return refreshedArn, nil
 		}
 	}
