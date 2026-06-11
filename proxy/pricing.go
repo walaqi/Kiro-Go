@@ -118,23 +118,23 @@ func pricingLookupCandidates(model string) []string {
 	return candidates
 }
 
-// calibrateScaledUsage rescales the variable usage components (output,
-// cache_read, cache_creation) so that the total list-price cost of the reported
-// usage matches the dollar value implied by the upstream credits, while leaving
-// the billed input_tokens untouched to avoid disturbing client compaction
-// signals.
+// calibrateScaledUsage rescales only the cache usage components
+// (cache_read, cache_creation) so that the total list-price cost of the
+// reported usage matches the dollar value implied by the upstream credits.
+// Both input_tokens and output_tokens are held fixed: input_tokens must not
+// change to avoid disturbing client compaction signals, and output_tokens is
+// a direct local count of generated text that should be reported as-is.
 //
-// The fixed cost is billedInput * input_price. The variable cost at list price
-// is output*p_out + cache_read*p_cr + cc5m*p_5m + cc1h*p_1h. We solve for a
-// single scale factor s such that:
+// The fixed cost is billedInput*input_price + output*output_price. The
+// variable cost is cache_read*p_cr + cc5m*p_5m + cc1h*p_1h. We solve for s:
 //
 //	fixedCost + s * variableCost = credits * CreditsToUSD
 //
-// then apply s to output and the three cache components. Calibration is skipped
-// (returning the inputs unchanged with applied=false) when credits are absent,
-// the model price is unknown, there is nothing to scale, or the target dollar
-// amount cannot be reached without driving the variable components to zero or
-// negative.
+// Calibration is skipped (applied=false, inputs returned unchanged) when:
+//   - credits <= 0
+//   - model pricing is unknown
+//   - variableCost <= 0 (no cache activity — nothing to scale)
+//   - target <= fixedCost (scale would be <=0; logs a warning)
 func calibrateScaledUsage(model string, credits float64, billedInput, output int, usage promptCacheUsage) (int, promptCacheUsage, bool) {
 	if credits <= 0 {
 		return output, usage, false
@@ -145,27 +145,23 @@ func calibrateScaledUsage(model string, credits float64, billedInput, output int
 		return output, usage, false
 	}
 
-	variableCost := float64(output)*pricing.OutputCostPerToken +
-		float64(usage.CacheReadInputTokens)*pricing.CacheReadInputTokenCost +
+	variableCost := float64(usage.CacheReadInputTokens)*pricing.CacheReadInputTokenCost +
 		float64(usage.CacheCreation5mInputTokens)*pricing.CacheCreationInputTokenCost +
 		float64(usage.CacheCreation1hInputTokens)*pricing.CacheCreation1hInputTokenCost
 	if variableCost <= 0 {
-		// Nothing to scale (no output and no cache activity).
+		// No cache activity — nothing to scale.
 		return output, usage, false
 	}
 
 	target := credits * config.GetCreditsToUSD()
-	fixedCost := float64(billedInput) * pricing.InputCostPerToken
+	fixedCost := float64(billedInput)*pricing.InputCostPerToken +
+		float64(output)*pricing.OutputCostPerToken
 	scale := (target - fixedCost) / variableCost
 	if scale <= 0 {
-		// The fixed input cost alone already meets or exceeds the target; scaling
-		// the variable parts would zero them out or go negative. Leave the
-		// heuristic values untouched.
-		logger.Warnf("credit calibration skipped for model %s: target $%.6f below fixed input cost $%.6f (credits=%.4f)", model, target, fixedCost, credits)
+		logger.Warnf("credit calibration skipped for model %s: target $%.6f below fixed cost $%.6f (credits=%.4f)", model, target, fixedCost, credits)
 		return output, usage, false
 	}
 
-	scaledOutput := scaleToken(output, scale)
 	scaledRead := scaleToken(usage.CacheReadInputTokens, scale)
 	scaled5m := scaleToken(usage.CacheCreation5mInputTokens, scale)
 	scaled1h := scaleToken(usage.CacheCreation1hInputTokens, scale)
@@ -176,7 +172,7 @@ func calibrateScaledUsage(model string, credits float64, billedInput, output int
 	calibrated.CacheCreation1hInputTokens = scaled1h
 	calibrated.CacheCreationInputTokens = scaled5m + scaled1h
 
-	return scaledOutput, calibrated, true
+	return output, calibrated, true
 }
 
 // scaleToken multiplies a token count by the scale factor and rounds to the
