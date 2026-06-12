@@ -125,8 +125,14 @@ func pricingLookupCandidates(model string) []string {
 // change to avoid disturbing client compaction signals, and output_tokens is
 // a direct local count of generated text that should be reported as-is.
 //
+// Before solving the scale, an optional CacheReadBias b in [0,1) shifts that
+// fraction of the inferred cache_creation totals (5m and 1h) into cache_read,
+// so the displayed cache hit ratio rises while the total billed dollars remain
+// pinned to credits*CreditsToUSD by the subsequent scale solve.
+//
 // The fixed cost is billedInput*input_price + output*output_price. The
-// variable cost is cache_read*p_cr + cc5m*p_5m + cc1h*p_1h. We solve for s:
+// variable cost is cache_read*p_cr + cc5m*p_5m + cc1h*p_1h (computed from the
+// post-bias values). We solve for s:
 //
 //	fixedCost + s * variableCost = credits * CreditsToUSD
 //
@@ -145,9 +151,21 @@ func calibrateScaledUsage(model string, credits float64, billedInput, output int
 		return output, usage, false
 	}
 
-	variableCost := float64(usage.CacheReadInputTokens)*pricing.CacheReadInputTokenCost +
-		float64(usage.CacheCreation5mInputTokens)*pricing.CacheCreationInputTokenCost +
-		float64(usage.CacheCreation1hInputTokens)*pricing.CacheCreation1hInputTokenCost
+	bias := config.GetCacheReadBias()
+	read := float64(usage.CacheReadInputTokens)
+	cc5m := float64(usage.CacheCreation5mInputTokens)
+	cc1h := float64(usage.CacheCreation1hInputTokens)
+	if bias > 0 {
+		shifted5m := cc5m * bias
+		shifted1h := cc1h * bias
+		read += shifted5m + shifted1h
+		cc5m -= shifted5m
+		cc1h -= shifted1h
+	}
+
+	variableCost := read*pricing.CacheReadInputTokenCost +
+		cc5m*pricing.CacheCreationInputTokenCost +
+		cc1h*pricing.CacheCreation1hInputTokenCost
 	if variableCost <= 0 {
 		// No cache activity — nothing to scale.
 		return output, usage, false
@@ -162,9 +180,9 @@ func calibrateScaledUsage(model string, credits float64, billedInput, output int
 		return output, usage, false
 	}
 
-	scaledRead := scaleToken(usage.CacheReadInputTokens, scale)
-	scaled5m := scaleToken(usage.CacheCreation5mInputTokens, scale)
-	scaled1h := scaleToken(usage.CacheCreation1hInputTokens, scale)
+	scaledRead := scaleFloatToken(read, scale)
+	scaled5m := scaleFloatToken(cc5m, scale)
+	scaled1h := scaleFloatToken(cc1h, scale)
 
 	calibrated := usage
 	calibrated.CacheReadInputTokens = scaledRead
@@ -175,13 +193,15 @@ func calibrateScaledUsage(model string, credits float64, billedInput, output int
 	return output, calibrated, true
 }
 
-// scaleToken multiplies a token count by the scale factor and rounds to the
-// nearest non-negative integer.
-func scaleToken(tokens int, scale float64) int {
+// scaleFloatToken multiplies a (possibly non-integer) token count by the scale
+// factor and rounds to the nearest non-negative integer. The float input lets
+// the caller pass already-redistributed totals (e.g. after the CacheReadBias
+// shift) without a premature integer round-trip.
+func scaleFloatToken(tokens float64, scale float64) int {
 	if tokens <= 0 {
 		return 0
 	}
-	scaled := int(math.Round(float64(tokens) * scale))
+	scaled := int(math.Round(tokens * scale))
 	if scaled < 0 {
 		return 0
 	}
