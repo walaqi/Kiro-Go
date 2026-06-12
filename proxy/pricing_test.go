@@ -2,7 +2,10 @@ package proxy
 
 import (
 	"math"
+	"path/filepath"
 	"testing"
+
+	"kiro-go/config"
 )
 
 // totalListPriceCost computes the published list-price dollar cost of a reported
@@ -178,5 +181,63 @@ func TestCalibrateScaledUsageDoesNotMutateInputUsage(t *testing.T) {
 	_, _, _ = calibrateScaledUsage("claude-sonnet-4.5", 1.0, 1000, 500, usage)
 	if usage != snapshot {
 		t.Fatalf("calibrateScaledUsage mutated its input usage: %+v != %+v", usage, snapshot)
+	}
+}
+
+func TestCalibrateScaledUsageCacheReadBias(t *testing.T) {
+	dir := t.TempDir()
+	if err := config.Init(filepath.Join(dir, "config.json")); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	t.Cleanup(func() { _ = config.UpdateCacheReadBias(0) })
+
+	model := "claude-sonnet-4.5"
+	pricing, ok := lookupModelPricing(model)
+	if !ok {
+		t.Fatalf("expected pricing for %s", model)
+	}
+
+	billedInput := 1000
+	output := 500
+	usage := promptCacheUsage{
+		CacheReadInputTokens:       2000,
+		CacheCreation5mInputTokens: 1000,
+		CacheCreation1hInputTokens: 200,
+		CacheCreationInputTokens:   1200,
+	}
+	credits := 1.0
+	target := credits * config.GetCreditsToUSD()
+
+	_, baseline, baseApplied := calibrateScaledUsage(model, credits, billedInput, output, usage)
+	if !baseApplied {
+		t.Fatalf("baseline calibration must apply")
+	}
+
+	if err := config.UpdateCacheReadBias(0.6); err != nil {
+		t.Fatalf("UpdateCacheReadBias: %v", err)
+	}
+	_, biased, biasedApplied := calibrateScaledUsage(model, credits, billedInput, output, usage)
+	if !biasedApplied {
+		t.Fatalf("biased calibration must apply")
+	}
+
+	if biased.CacheReadInputTokens <= baseline.CacheReadInputTokens {
+		t.Fatalf("expected cache_read to grow under bias: baseline=%d biased=%d",
+			baseline.CacheReadInputTokens, biased.CacheReadInputTokens)
+	}
+	if biased.CacheCreationInputTokens >= baseline.CacheCreationInputTokens {
+		t.Fatalf("expected cache_creation to shrink under bias: baseline=%d biased=%d",
+			baseline.CacheCreationInputTokens, biased.CacheCreationInputTokens)
+	}
+	if biased.CacheCreationInputTokens != biased.CacheCreation5mInputTokens+biased.CacheCreation1hInputTokens {
+		t.Fatalf("cache_creation breakdown must remain consistent: total=%d 5m=%d 1h=%d",
+			biased.CacheCreationInputTokens, biased.CacheCreation5mInputTokens, biased.CacheCreation1hInputTokens)
+	}
+
+	costAfter := totalListPriceCost(pricing, billedInput, output, biased)
+	tol := 10 * pricing.OutputCostPerToken
+	if math.Abs(costAfter-target) > tol {
+		t.Fatalf("biased calibrated cost $%.6f not within $%.6f of target $%.6f",
+			costAfter, tol, target)
 	}
 }
