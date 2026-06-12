@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"time"
@@ -101,12 +102,14 @@ type Account struct {
 	TrialStatus       string  `json:"trialStatus,omitempty"`       // Trial status: ACTIVE, EXPIRED, NONE
 	TrialExpiresAt    int64   `json:"trialExpiresAt,omitempty"`    // Trial expiration timestamp (Unix seconds)
 
-	// Runtime statistics (updated during operation)
-	RequestCount int     `json:"requestCount,omitempty"` // Total requests processed
-	ErrorCount   int     `json:"errorCount,omitempty"`   // Total errors encountered
-	LastUsed     int64   `json:"lastUsed,omitempty"`     // Last request timestamp
-	TotalTokens  int     `json:"totalTokens,omitempty"`  // Cumulative tokens processed
-	TotalCredits float64 `json:"totalCredits,omitempty"` // Cumulative credits consumed
+	// Runtime statistics (updated during operation). Persisted to the sibling
+	// state file (see state.go), not config.json — hence json:"-". These remain
+	// the authoritative in-memory copy read by the admin panel and pool seeding.
+	RequestCount int     `json:"-"` // Total requests processed
+	ErrorCount   int     `json:"-"` // Total errors encountered
+	LastUsed     int64   `json:"-"` // Last request timestamp
+	TotalTokens  int     `json:"-"` // Cumulative tokens processed
+	TotalCredits float64 `json:"-"` // Cumulative credits consumed
 }
 
 // SystemPromptInjection appends or prepends a fixed text block to the Claude
@@ -156,16 +159,17 @@ type ApiKeyEntry struct {
 	Enabled    bool   `json:"enabled"`            // Whether this key may authenticate
 	Migrated   bool   `json:"migrated,omitempty"` // True if migrated from legacy single ApiKey field
 	CreatedAt  int64  `json:"createdAt"`          // Creation timestamp (Unix seconds)
-	LastUsedAt int64  `json:"lastUsedAt,omitempty"`
+	LastUsedAt int64  `json:"-"`                  // Persisted to state file, not config.json
 
 	// Limits (0 = unlimited)
 	TokenLimit  int64   `json:"tokenLimit,omitempty"`
 	CreditLimit float64 `json:"creditLimit,omitempty"`
 
-	// Cumulative usage (never auto-reset)
-	TokensUsed    int64   `json:"tokensUsed,omitempty"`
-	CreditsUsed   float64 `json:"creditsUsed,omitempty"`
-	RequestsCount int64   `json:"requestsCount,omitempty"`
+	// Cumulative usage (never auto-reset). Persisted to the sibling state file
+	// (see state.go), not config.json — hence json:"-".
+	TokensUsed    int64   `json:"-"`
+	CreditsUsed   float64 `json:"-"`
+	RequestsCount int64   `json:"-"`
 }
 
 // PricingConfig holds the upstream source URLs for the model pricing table used
@@ -266,12 +270,14 @@ type Config struct {
 	// Can be overridden by the LOG_LEVEL environment variable.
 	LogLevel string `json:"logLevel,omitempty"`
 
-	// Global statistics (persisted across restarts)
-	TotalRequests   int     `json:"totalRequests,omitempty"`   // Total API requests received
-	SuccessRequests int     `json:"successRequests,omitempty"` // Successful requests count
-	FailedRequests  int     `json:"failedRequests,omitempty"`  // Failed requests count
-	TotalTokens     int     `json:"totalTokens,omitempty"`     // Total tokens processed
-	TotalCredits    float64 `json:"totalCredits,omitempty"`    // Total credits consumed
+	// Global statistics. Persisted to the sibling state file (see state.go), not
+	// config.json — hence json:"-". They remain the authoritative in-memory copy
+	// seeded into the handler on startup via GetStats.
+	TotalRequests   int     `json:"-"` // Total API requests received
+	SuccessRequests int     `json:"-"` // Successful requests count
+	FailedRequests  int     `json:"-"` // Failed requests count
+	TotalTokens     int     `json:"-"` // Total tokens processed
+	TotalCredits    float64 `json:"-"` // Total credits consumed
 }
 
 // AccountInfo contains account metadata retrieved from Kiro API.
@@ -311,6 +317,7 @@ var (
 // If the file doesn't exist, a default configuration is created.
 func Init(path string) error {
 	cfgPath = path
+	statePath = deriveStatePath(path)
 	return Load()
 }
 
@@ -331,7 +338,16 @@ func Load() error {
 				Accounts:      []Account{},
 				Pricing:       defaultPricingConfig(),
 			}
-			return saveLocked()
+			if err := saveLocked(); err != nil {
+				return err
+			}
+			// Fresh install: no legacy counters to migrate. Initialize an empty
+			// state file alongside the new config. loadStateLocked applies the
+			// (empty) state into cfg internally.
+			if _, err := loadStateLocked(nil); err != nil {
+				return err
+			}
+			return nil
 		}
 		return err
 	}
@@ -384,6 +400,24 @@ func Load() error {
 			return err
 		}
 	}
+
+	// Initialize the runtime-state store. When state.json is absent, seed it from
+	// any inline counters still present in the raw config bytes (older configs).
+	// Because the stat fields are now json:"-", they were not loaded into cfg by
+	// the unmarshal above; loadStateLocked restores them into cfg from state.
+	stateMigrated, err := loadStateLocked(data)
+	if err != nil {
+		return err
+	}
+
+	// When we just migrated inline counters out of a legacy config.json, rewrite
+	// it so the now-orphaned stat fields are dropped from disk on first launch
+	// (they live in state.json from here on).
+	if stateMigrated {
+		if err := saveLocked(); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -400,13 +434,51 @@ func newUUID() string {
 }
 
 // Save persists the current configuration to the JSON file.
-// Uses indented formatting for human readability.
+// Uses indented formatting for human readability. The write is atomic: data is
+// written to a temp file and renamed over the target, so a crash mid-write can
+// never leave a truncated or corrupt config.json (which holds refresh tokens).
 func Save() error {
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(cfgPath, data, 0600)
+	return writeFileAtomic(cfgPath, data, 0600)
+}
+
+// writeFileAtomic writes data to path atomically by writing to a sibling temp
+// file in the same directory, fsync-ing it, then renaming over the target.
+// rename(2) within a filesystem is atomic, so readers see either the old file
+// or the fully-written new one, never a partial write. The temp file is removed
+// on any error before the rename completes.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".tmp-"+filepath.Base(path)+"-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	// Best-effort cleanup if we bail out before the successful rename.
+	defer func() {
+		if _, statErr := os.Stat(tmpName); statErr == nil {
+			_ = os.Remove(tmpName)
+		}
+	}()
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpName, perm); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 // SetPassword updates the admin password.
@@ -585,7 +657,14 @@ func DeleteAccount(id string) error {
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
 			cfg.Accounts = append(cfg.Accounts[:i], cfg.Accounts[i+1:]...)
-			return Save()
+			if err := Save(); err != nil {
+				return err
+			}
+			// state.json is derived from cfg at flush time, so re-flushing after
+			// the account is gone automatically drops its persisted counters —
+			// no orphan entries accumulate. Cold admin path, so the brief flush
+			// under cfgLock is acceptable.
+			return persistStateLocked()
 		}
 	}
 	return nil
@@ -645,15 +724,20 @@ func UpdateSettingsPatch(apiKey *string, requireApiKey *bool, password string) e
 	return Save()
 }
 
+// UpdateStats updates the process-wide totals. These are hot-path counters, so
+// they are persisted to the sibling state file (state.go) rather than rewriting
+// config.json. The in-memory cfg copy is kept in sync for GetStats readers.
 func UpdateStats(totalReq, successReq, failedReq, totalTokens int, totalCredits float64) error {
 	cfgLock.Lock()
-	defer cfgLock.Unlock()
 	cfg.TotalRequests = totalReq
 	cfg.SuccessRequests = successReq
 	cfg.FailedRequests = failedReq
 	cfg.TotalTokens = totalTokens
 	cfg.TotalCredits = totalCredits
-	return Save()
+	cfgLock.Unlock()
+	// Flush the derived snapshot to state.json. persistState re-snapshots cfg
+	// under its own RLock, so cfgLock must already be released here.
+	return persistState()
 }
 
 func GetStats() (int, int, int, int, float64) {
@@ -662,9 +746,12 @@ func GetStats() (int, int, int, int, float64) {
 	return cfg.TotalRequests, cfg.SuccessRequests, cfg.FailedRequests, cfg.TotalTokens, cfg.TotalCredits
 }
 
+// UpdateAccountStats updates an account's runtime counters. Like UpdateStats,
+// these are hot-path values persisted to the sibling state file rather than
+// config.json. Returns nil (no-op) when the account ID is unknown.
 func UpdateAccountStats(id string, requestCount, errorCount, totalTokens int, totalCredits float64, lastUsed int64) error {
 	cfgLock.Lock()
-	defer cfgLock.Unlock()
+	found := false
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
 			cfg.Accounts[i].RequestCount = requestCount
@@ -672,10 +759,15 @@ func UpdateAccountStats(id string, requestCount, errorCount, totalTokens int, to
 			cfg.Accounts[i].TotalTokens = totalTokens
 			cfg.Accounts[i].TotalCredits = totalCredits
 			cfg.Accounts[i].LastUsed = lastUsed
-			return Save()
+			found = true
+			break
 		}
 	}
-	return nil
+	cfgLock.Unlock()
+	if !found {
+		return nil
+	}
+	return persistState()
 }
 
 // UpdateAccountInfo updates an account's subscription and usage information.

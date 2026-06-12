@@ -123,7 +123,13 @@ func DeleteApiKey(id string) error {
 	for i, e := range cfg.ApiKeys {
 		if e.ID == id {
 			cfg.ApiKeys = append(cfg.ApiKeys[:i], cfg.ApiKeys[i+1:]...)
-			return saveLocked()
+			if err := saveLocked(); err != nil {
+				return err
+			}
+			// Re-derive state.json from the now-shorter cfg so the key's usage
+			// counters are dropped and can't resurrect on a recreated key. Cold
+			// admin path, so flushing under cfgLock is acceptable.
+			return persistStateLocked()
 		}
 	}
 	return nil
@@ -157,13 +163,16 @@ func HasApiKeys() bool {
 }
 
 // RecordApiKeyUsage atomically adds tokens and credits to the entry's counters,
-// updates LastUsedAt, increments RequestsCount, and persists.
+// updates LastUsedAt, increments RequestsCount, and persists. These are hot-path
+// usage counters, so they are written to the sibling state file (state.go) rather
+// than rewriting config.json. The in-memory entry is kept in sync for readers.
 func RecordApiKeyUsage(id string, tokens int64, credits float64) error {
 	cfgLock.Lock()
-	defer cfgLock.Unlock()
 	if cfg == nil {
+		cfgLock.Unlock()
 		return errors.New("config not initialized")
 	}
+	found := false
 	for i := range cfg.ApiKeys {
 		if cfg.ApiKeys[i].ID == id {
 			if tokens > 0 {
@@ -174,29 +183,40 @@ func RecordApiKeyUsage(id string, tokens int64, credits float64) error {
 			}
 			cfg.ApiKeys[i].RequestsCount++
 			cfg.ApiKeys[i].LastUsedAt = time.Now().Unix()
-			return saveLocked()
+			found = true
+			break
 		}
 	}
-	return errors.New("api key not found")
+	cfgLock.Unlock()
+	if !found {
+		return errors.New("api key not found")
+	}
+	return persistState()
 }
 
 // ResetApiKeyUsage clears TokensUsed/CreditsUsed/RequestsCount for the entry.
 // LastUsedAt is preserved so operators can still see when the key was last used.
 func ResetApiKeyUsage(id string) error {
 	cfgLock.Lock()
-	defer cfgLock.Unlock()
 	if cfg == nil {
+		cfgLock.Unlock()
 		return errors.New("config not initialized")
 	}
+	found := false
 	for i := range cfg.ApiKeys {
 		if cfg.ApiKeys[i].ID == id {
 			cfg.ApiKeys[i].TokensUsed = 0
 			cfg.ApiKeys[i].CreditsUsed = 0
 			cfg.ApiKeys[i].RequestsCount = 0
-			return saveLocked()
+			found = true
+			break
 		}
 	}
-	return errors.New("api key not found")
+	cfgLock.Unlock()
+	if !found {
+		return errors.New("api key not found")
+	}
+	return persistState()
 }
 
 // GenerateApiKeyValue returns a new random 32-byte hex API key prefixed with "sk-".
