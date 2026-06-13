@@ -255,9 +255,13 @@ func flattenClaudeCacheBlocks(req *ClaudeRequest) []cacheablePromptBlock {
 			"input_schema": tool.InputSchema,
 		}
 		fingerprintValue := stripCachePositionKeys(toolValue)
+		// Content-token count must match the input estimator's tool accounting
+		// (name + description + input_schema), not the JSON-serialized wrapper,
+		// so the cumulative cache total never exceeds estimated input.
+		toolTokens := countTokens(tool.Name) + countTokens(tool.Description) + countClaudeJSONTokens(tool.InputSchema)
 		blocks = append(blocks, cacheablePromptBlock{
 			Value:  fingerprintValue,
-			Tokens: countTokens(canonicalizeCacheValue(fingerprintValue)),
+			Tokens: toolTokens,
 			TTL:    normalizePromptCacheTTL(extractPromptCacheTTL(tool)),
 		})
 	}
@@ -278,7 +282,10 @@ func buildCachePreludeBlock(req *ClaudeRequest) cacheablePromptBlock {
 		"tool_choice": req.ToolChoice,
 	}
 	return cacheablePromptBlock{
-		Value:  prelude,
+		Value: prelude,
+		// The prelude carries only small structural metadata (model + tool_choice),
+		// so its canonical JSON is counted directly. It is tiny relative to the
+		// content blocks and never the dominant term in the cache total.
 		Tokens: countTokens(canonicalizeCacheValue(prelude)),
 	}
 }
@@ -366,10 +373,14 @@ func appendPromptBlock(blocks *[]cacheablePromptBlock, wrapper map[string]interf
 	}
 
 	fingerprintValue := stripCachePositionKeys(wrapper)
-	canonical := canonicalizeCacheValue(fingerprintValue)
 	*blocks = append(*blocks, cacheablePromptBlock{
-		Value:        fingerprintValue,
-		Tokens:       countTokens(canonical),
+		Value: fingerprintValue,
+		// Count the block's CONTENT tokens with the same leaf-counting the input
+		// estimator uses (estimateClaudeValueTokens), not the JSON-serialized
+		// wrapper. Counting canonicalized JSON inflated every block by its
+		// structural keys/quotes/escapes, pushing the cumulative cache total
+		// above estimateClaudeRequestInputTokens and collapsing billed input to 0.
+		Tokens:       estimateClaudeValueTokens(blockValue),
 		TTL:          ttl,
 		IsMessageEnd: isMessageEnd,
 	})
