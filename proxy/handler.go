@@ -884,7 +884,6 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 
 		var inputTokens, outputTokens int
 		var credits float64
-		var realInputTokens int
 		var toolUses []KiroToolUse
 		var nextContentIndex int
 		var rawContentBuilder strings.Builder
@@ -1192,9 +1191,6 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			OnCredits: func(c float64) {
 				credits = c
 			},
-			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
-			},
 		}
 
 		err := CallKiroAPI(account, payload, callback)
@@ -1219,11 +1215,11 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		}
 		closeActiveBlock()
 
-		if realInputTokens > 0 {
-			inputTokens = realInputTokens
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
-		}
+		// Upstream Kiro reports no input-token count, so the locally computed
+		// tiktoken estimate is authoritative. (Previously a contextUsagePercentage
+		// × window reconstruction overrode it, which over-reported small requests
+		// and, after subtracting cache tokens, could collapse billed input to 0.)
+		inputTokens = estimatedInputTokens
 		outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
 		thinkingOutput := rawThinkingBuilder.String()
 		if thinking && thinkingOutput == "" && extractedReasoning != "" {
@@ -1371,7 +1367,6 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		var toolUses []KiroToolUse
 		var inputTokens, outputTokens int
 		var credits float64
-		var realInputTokens int
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -1390,9 +1385,6 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			},
 			OnCredits: func(c float64) {
 				credits = c
-			},
-			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
 		}
 
@@ -1414,11 +1406,11 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			rawThinkingContent = ""
 		}
 
-		if realInputTokens > 0 {
-			inputTokens = realInputTokens
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
-		}
+		// input_tokens is always the local tiktoken estimate: upstream Kiro
+		// returns no token usage, so OnComplete's inputTokens is 0 here. The
+		// estimate shares the tokenizer used for cache profiling and output, so
+		// billedClaudeInputTokens stays on one consistent scale (no spurious 0).
+		inputTokens = estimatedInputTokens
 		outputTokens = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)

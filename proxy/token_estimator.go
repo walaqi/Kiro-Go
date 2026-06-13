@@ -58,12 +58,28 @@ func estimateClaudeRequestInputTokens(req *ClaudeRequest) int {
 	}
 
 	for _, tool := range req.Tools {
-		total += estimateApproxTokens(tool.Name)
-		total += estimateApproxTokens(tool.Description)
-		total += estimateJSONTokens(tool.InputSchema)
+		total += countTokens(tool.Name)
+		total += countTokens(tool.Description)
+		total += countClaudeJSONTokens(tool.InputSchema)
 	}
 
 	return total
+}
+
+// countClaudeJSONTokens is the Claude-input-path counterpart of
+// estimateJSONTokens: it marshals v and counts the result with the shared
+// tiktoken encoder (countTokens) instead of the character-class heuristic. It is
+// defined separately so the Claude input estimator can move to tiktoken without
+// disturbing estimateJSONTokens, which the OpenAI input path still shares.
+func countClaudeJSONTokens(v interface{}) int {
+	if v == nil {
+		return 0
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return 0
+	}
+	return countTokens(string(b))
 }
 
 func estimateClaudeOutputTokens(content, thinkingContent string, toolUses []KiroToolUse) int {
@@ -85,7 +101,7 @@ func estimateClaudeValueTokens(v interface{}) int {
 	case nil:
 		return 0
 	case string:
-		return estimateApproxTokens(value)
+		return countTokens(value)
 	case []interface{}:
 		total := 0
 		for _, part := range value {
@@ -97,19 +113,19 @@ func estimateClaudeValueTokens(v interface{}) int {
 		switch typeName {
 		case "text":
 			if text, ok := value["text"].(string); ok {
-				return estimateApproxTokens(text)
+				return countTokens(text)
 			}
 		case "thinking":
 			if thinking, ok := value["thinking"].(string); ok {
-				return estimateApproxTokens(thinking)
+				return countTokens(thinking)
 			}
 		case "tool_use":
 			total := 0
 			if name, ok := value["name"].(string); ok {
-				total += estimateApproxTokens(name)
+				total += countTokens(name)
 			}
 			if input, ok := value["input"]; ok {
-				total += estimateJSONTokens(input)
+				total += countClaudeJSONTokens(input)
 			}
 			if total > 0 {
 				return total
@@ -122,10 +138,10 @@ func estimateClaudeValueTokens(v interface{}) int {
 
 		total := 0
 		if text, ok := value["text"].(string); ok {
-			total += estimateApproxTokens(text)
+			total += countTokens(text)
 		}
 		if thinking, ok := value["thinking"].(string); ok {
-			total += estimateApproxTokens(thinking)
+			total += countTokens(thinking)
 		}
 		if content, ok := value["content"]; ok {
 			total += estimateClaudeValueTokens(content)
@@ -134,9 +150,9 @@ func estimateClaudeValueTokens(v interface{}) int {
 			return total
 		}
 
-		return estimateJSONTokens(value)
+		return countClaudeJSONTokens(value)
 	default:
-		return estimateJSONTokens(value)
+		return countClaudeJSONTokens(value)
 	}
 }
 

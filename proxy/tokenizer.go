@@ -24,9 +24,11 @@ func initTokenizer() {
 	tke = enc
 }
 
-// countOutputTokens counts tokens using cl100k_base BPE when available.
-// Falls back to the char-class heuristic if the encoding fails to load.
-func countOutputTokens(text string) int {
+// countTokens returns the BPE token count of text using the cl100k_base
+// tiktoken encoder, falling back to the character-class heuristic when the
+// encoder failed to initialize. It is the shared core for both input and output
+// token estimation so the whole usage pipeline keeps a single tokenizer.
+func countTokens(text string) int {
 	if text == "" {
 		return 0
 	}
@@ -35,4 +37,10 @@ func countOutputTokens(text string) int {
 		return estimateApproxTokens(text)
 	}
 	return len(tke.Encode(text, nil, nil))
+}
+
+// countOutputTokens is retained as the output-side name; it delegates to
+// countTokens so input and output share one tokenizer implementation.
+func countOutputTokens(text string) int {
+	return countTokens(text)
 }
