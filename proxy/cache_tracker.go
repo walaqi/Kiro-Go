@@ -283,10 +283,15 @@ func buildCachePreludeBlock(req *ClaudeRequest) cacheablePromptBlock {
 	}
 	return cacheablePromptBlock{
 		Value: prelude,
-		// The prelude carries only small structural metadata (model + tool_choice),
-		// so its canonical JSON is counted directly. It is tiny relative to the
-		// content blocks and never the dominant term in the cache total.
-		Tokens: countTokens(canonicalizeCacheValue(prelude)),
+		// The prelude exists only to seed the cache fingerprint with the request's
+		// structural metadata (model + tool_choice); it is not real prompt content
+		// and the input estimator never counts it. Counting its serialized JSON
+		// added a fixed ~23 tokens to the cache total that input never has, so a
+		// fully-cached first turn ended with cache sum > estimated input and billed
+		// input collapsed to 0. Contribute 0 tokens so the cache total can never
+		// exceed estimated input from this block. Value is unchanged, so the
+		// fingerprint (and thus cache hit/miss behavior) is unaffected.
+		Tokens: 0,
 	}
 }
 
