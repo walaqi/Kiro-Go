@@ -257,7 +257,7 @@ func flattenClaudeCacheBlocks(req *ClaudeRequest) []cacheablePromptBlock {
 		fingerprintValue := stripCachePositionKeys(toolValue)
 		blocks = append(blocks, cacheablePromptBlock{
 			Value:  fingerprintValue,
-			Tokens: estimateApproxTokens(canonicalizeCacheValue(fingerprintValue)),
+			Tokens: countTokens(canonicalizeCacheValue(fingerprintValue)),
 			TTL:    normalizePromptCacheTTL(extractPromptCacheTTL(tool)),
 		})
 	}
@@ -279,7 +279,7 @@ func buildCachePreludeBlock(req *ClaudeRequest) cacheablePromptBlock {
 	}
 	return cacheablePromptBlock{
 		Value:  prelude,
-		Tokens: estimateApproxTokens(canonicalizeCacheValue(prelude)),
+		Tokens: countTokens(canonicalizeCacheValue(prelude)),
 	}
 }
 
@@ -369,7 +369,7 @@ func appendPromptBlock(blocks *[]cacheablePromptBlock, wrapper map[string]interf
 	canonical := canonicalizeCacheValue(fingerprintValue)
 	*blocks = append(*blocks, cacheablePromptBlock{
 		Value:        fingerprintValue,
-		Tokens:       estimateApproxTokens(canonical),
+		Tokens:       countTokens(canonical),
 		TTL:          ttl,
 		IsMessageEnd: isMessageEnd,
 	})

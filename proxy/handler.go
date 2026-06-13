@@ -820,14 +820,14 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	// Stream or non-stream
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	if req.Stream {
-		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, body)
 	} else {
-		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, body)
 	}
 }
 
 // handleClaudeStream Claude 流式响应
-func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, reqBody []byte) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1248,17 +1248,35 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		// compaction signals.
 		billedInput := billedClaudeInputTokens(inputTokens, cacheUsage)
 		reportOutput, reportUsage, _ := calibrateScaledUsage(model, credits, billedInput, outputTokens, cacheUsage)
+		usageMap := buildClaudeUsageMapExplicit(billedInput, reportOutput, reportUsage, cacheProfile != nil)
 		h.sendSSE(w, flusher, "message_delta", map[string]interface{}{
 			"type": "message_delta",
 			"delta": map[string]interface{}{
 				"stop_reason": stopReason,
 			},
-			"usage": buildClaudeUsageMapExplicit(billedInput, reportOutput, reportUsage, cacheProfile != nil),
+			"usage": usageMap,
 		})
 
 		h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
 			"type": "message_stop",
 		})
+
+		if billedInput == 0 {
+			// The SSE stream has no single response body, so reconstruct a
+			// snapshot of the final message (accumulated text + the usage block
+			// just emitted) for the diagnostic record.
+			respBody, _ := json.Marshal(map[string]interface{}{
+				"id":          msgID,
+				"type":        "message",
+				"role":        "assistant",
+				"model":       model,
+				"stop_reason": stopReason,
+				"content":     rawContentBuilder.String(),
+				"thinking":    rawThinkingBuilder.String(),
+				"usage":       usageMap,
+			})
+			logZeroInputTokens("/v1/messages (stream)", reqBody, respBody, billedInput, reportOutput, reportUsage)
+		}
 		return
 	}
 
@@ -1345,7 +1363,7 @@ func (h *Handler) recordFailure() {
 }
 
 // handleClaudeNonStream Claude 非流式响应
-func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, reqBody []byte) {
 	excluded := make(map[string]bool)
 	var lastErr error
 
@@ -1455,7 +1473,11 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			}
 		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		json.NewEncoder(w).Encode(resp)
+		respBody, _ := json.Marshal(resp)
+		w.Write(respBody)
+		if resp.Usage.InputTokens == 0 {
+			logZeroInputTokens("/v1/messages", reqBody, respBody, resp.Usage.InputTokens, resp.Usage.OutputTokens, reportUsage)
+		}
 		return
 	}
 
@@ -1466,6 +1488,29 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 
 	h.recordFailure()
 	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
+}
+
+// logZeroInputTokens asynchronously dumps a full diagnostic record whenever a
+// Claude response is returned to the client with input_tokens == 0. Billed
+// input is the local tiktoken estimate minus cached tokens, so a zero value is
+// either a legitimately fully-cached first turn or a residual tokenizer-scale
+// mismatch worth investigating. The original request body, the reconstructed
+// response body, and every reported usage field are recorded so the cause can
+// be diagnosed offline. reqBody/respBody must not be mutated after this call.
+func logZeroInputTokens(path string, reqBody, respBody []byte, inputTokens, outputTokens int, usage promptCacheUsage) {
+	go func() {
+		logger.Warnf(
+			"[zero-input-tokens] path=%s returned input_tokens=0 to client; "+
+				"input_tokens=%d output_tokens=%d "+
+				"cache_creation_input_tokens=%d cache_read_input_tokens=%d "+
+				"ephemeral_5m_input_tokens=%d ephemeral_1h_input_tokens=%d\n"+
+				"request=%s\nresponse=%s",
+			path, inputTokens, outputTokens,
+			usage.CacheCreationInputTokens, usage.CacheReadInputTokens,
+			usage.CacheCreation5mInputTokens, usage.CacheCreation1hInputTokens,
+			string(reqBody), string(respBody),
+		)
+	}()
 }
 
 func (h *Handler) sendClaudeError(w http.ResponseWriter, status int, errType, message string) {
