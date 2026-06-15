@@ -130,6 +130,12 @@ type ClaudeRequest struct {
 	Thinking    *ClaudeThinkingConfig `json:"thinking,omitempty"`
 	Tools       []ClaudeTool          `json:"tools,omitempty"`
 	ToolChoice  interface{}           `json:"tool_choice,omitempty"`
+
+	// StopSequences are custom sequences that, when generated, halt the response.
+	// Kiro's upstream API does not accept a stop parameter, so these are enforced
+	// adapter-side: the response stream is scanned and truncated at the first
+	// match (see stop_sequence_filter.go).
+	StopSequences []string `json:"stop_sequences,omitempty"`
 }
 
 type ClaudeThinkingConfig struct {
@@ -312,6 +318,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	// 构建 payload
 	payload := &KiroPayload{}
 	payload.ToolNameMap = toolNameMap
+	payload.StopSequences = req.StopSequences
 	payload.ConversationState.ChatTriggerType = "MANUAL"
 	payload.ConversationState.AgentTaskType = "vibe"
 	payload.ConversationState.AgentContinuationId = uuid.New().String()
@@ -978,6 +985,42 @@ type OpenAIRequest struct {
 	TopP        float64         `json:"top_p,omitempty"`
 	Stream      bool            `json:"stream,omitempty"`
 	Tools       []OpenAITool    `json:"tools,omitempty"`
+
+	// Stop accepts the OpenAI "stop" parameter, which may be a single string or
+	// an array of strings. The raw JSON is normalized to []string via
+	// normalizeOpenAIStop and enforced adapter-side (Kiro's upstream API has no
+	// stop parameter).
+	Stop json.RawMessage `json:"stop,omitempty"`
+}
+
+// normalizeOpenAIStop converts the OpenAI "stop" value (a single string or an
+// array of strings) into a []string. Empty strings are dropped. Invalid or
+// absent values yield nil.
+func normalizeOpenAIStop(raw json.RawMessage) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	var single string
+	if err := json.Unmarshal(raw, &single); err == nil {
+		if single == "" {
+			return nil
+		}
+		return []string{single}
+	}
+	var many []string
+	if err := json.Unmarshal(raw, &many); err == nil {
+		out := make([]string, 0, len(many))
+		for _, s := range many {
+			if s != "" {
+				out = append(out, s)
+			}
+		}
+		if len(out) == 0 {
+			return nil
+		}
+		return out
+	}
+	return nil
 }
 
 type OpenAIMessage struct {
@@ -1241,6 +1284,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 
 	// 构建 payload
 	payload := &KiroPayload{}
+	payload.StopSequences = normalizeOpenAIStop(req.Stop)
 	payload.ConversationState.ChatTriggerType = "MANUAL"
 	payload.ConversationState.ConversationID = buildConversationID(modelID, systemPrompt, firstOpenAIConversationAnchor(nonSystemMessages))
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{

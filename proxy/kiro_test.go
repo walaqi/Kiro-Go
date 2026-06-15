@@ -7,6 +7,7 @@ import (
 	"kiro-go/config"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 )
@@ -54,7 +55,7 @@ func TestParseEventStreamFinishesPendingToolUseOnEOF(t *testing.T) {
 
 	var toolUses []KiroToolUse
 	var completed bool
-	err := parseEventStream(stream, &KiroStreamCallback{
+	err := parseEventStream(stream, nil, &KiroStreamCallback{
 		OnToolUse: func(toolUse KiroToolUse) {
 			toolUses = append(toolUses, toolUse)
 		},
@@ -92,7 +93,7 @@ func TestParseEventStreamNilCallbackIsNoOp(t *testing.T) {
 		}),
 	}, nil))
 
-	if err := parseEventStream(stream, nil); err != nil {
+	if err := parseEventStream(stream, nil, nil); err != nil {
 		t.Fatalf("expected nil callback to be a no-op, got %v", err)
 	}
 }
@@ -102,8 +103,57 @@ func TestParseEventStreamNilCallbackFieldsAreNoOp(t *testing.T) {
 		"content": "hello",
 	}))
 
-	if err := parseEventStream(stream, &KiroStreamCallback{}); err != nil {
+	if err := parseEventStream(stream, nil, &KiroStreamCallback{}); err != nil {
 		t.Fatalf("expected empty callback to be a no-op, got %v", err)
+	}
+}
+
+func TestParseEventStreamStopSequenceTruncatesButKeepsCredits(t *testing.T) {
+	// Visible text spread across two frames; the stop sequence "STOP" falls in
+	// the second frame. A metering event arrives AFTER the stop point — it must
+	// still be counted (credits reflect real upstream billing, independent of
+	// our client-facing truncation).
+	stream := bytes.NewReader(bytes.Join([][]byte{
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "hello "}),
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "hello world STOP after-the-cut"}),
+		awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
+			"toolUseId": "toolu_late",
+			"name":      "shouldBeDiscarded",
+			"input":     `{"x":1}`,
+			"stop":      true,
+		}),
+		awsEventStreamFrame(t, "meteringEvent", map[string]interface{}{"usage": 2.5}),
+	}, nil))
+
+	var text strings.Builder
+	var matched string
+	var toolUses []KiroToolUse
+	var credits float64
+	var completed bool
+	err := parseEventStream(stream, []string{"STOP"}, &KiroStreamCallback{
+		OnText:    func(s string, isThinking bool) { text.WriteString(s) },
+		OnToolUse: func(tu KiroToolUse) { toolUses = append(toolUses, tu) },
+		OnStopSequence: func(m string) { matched = m },
+		OnCredits: func(c float64) { credits = c },
+		OnComplete: func(_, _ int) { completed = true },
+	})
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+	if got := text.String(); got != "hello world " {
+		t.Fatalf("expected text truncated before stop sequence, got %q", got)
+	}
+	if matched != "STOP" {
+		t.Fatalf("expected matched stop sequence STOP, got %q", matched)
+	}
+	if len(toolUses) != 0 {
+		t.Fatalf("expected tool use after stop point to be discarded, got %d", len(toolUses))
+	}
+	if credits != 2.5 {
+		t.Fatalf("expected credits to flow despite truncation, got %v", credits)
+	}
+	if !completed {
+		t.Fatalf("expected completion callback")
 	}
 }
 

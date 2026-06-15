@@ -885,6 +885,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		var inputTokens, outputTokens int
 		var credits float64
 		var toolUses []KiroToolUse
+		var stopSeqMatched string
 		var nextContentIndex int
 		var rawContentBuilder strings.Builder
 		var rawThinkingBuilder strings.Builder
@@ -1191,6 +1192,9 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			OnCredits: func(c float64) {
 				credits = c
 			},
+			OnStopSequence: func(matched string) {
+				stopSeqMatched = matched
+			},
 		}
 
 		err := CallKiroAPI(account, payload, callback)
@@ -1235,9 +1239,19 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
 
+		// A matched stop sequence is the reason generation ended, so it takes
+		// precedence over end_turn/tool_use. The thinking trace is never matched
+		// (the native reasoning channel is exempt in parseEventStream), so this
+		// override cannot truncate or invalidate a signed thinking block.
 		stopReason := "end_turn"
 		if len(toolUses) > 0 {
 			stopReason = "tool_use"
+		}
+		var stopSequenceValue *string
+		if stopSeqMatched != "" {
+			stopReason = "stop_sequence"
+			matched := stopSeqMatched
+			stopSequenceValue = &matched
 		}
 
 		ensureMessageStart()
@@ -1251,7 +1265,8 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		h.sendSSE(w, flusher, "message_delta", map[string]interface{}{
 			"type": "message_delta",
 			"delta": map[string]interface{}{
-				"stop_reason": stopReason,
+				"stop_reason":   stopReason,
+				"stop_sequence": stopSequenceValue,
 			},
 			"usage": buildClaudeUsageMapExplicit(billedInput, reportOutput, reportUsage, cacheProfile != nil),
 		})
@@ -1367,6 +1382,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		var toolUses []KiroToolUse
 		var inputTokens, outputTokens int
 		var credits float64
+		var stopSeqMatched string
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -1385,6 +1401,9 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			},
 			OnCredits: func(c float64) {
 				credits = c
+			},
+			OnStopSequence: func(matched string) {
+				stopSeqMatched = matched
 			},
 		}
 
@@ -1444,6 +1463,13 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		reportOutput, reportUsage, _ := calibrateScaledUsage(model, credits, billedInput, outputTokens, cacheUsage)
 
 		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, reportOutput, model)
+		// A matched stop sequence is THE reason generation ended, so it takes
+		// precedence over the end_turn/tool_use default set by KiroToClaudeResponse.
+		if stopSeqMatched != "" {
+			matched := stopSeqMatched
+			resp.StopReason = "stop_sequence"
+			resp.StopSequence = &matched
+		}
 		resp.Usage.InputTokens = billedInput
 		resp.Usage.OutputTokens = reportOutput
 		resp.Usage.CacheCreationInputTokens = reportUsage.CacheCreationInputTokens
