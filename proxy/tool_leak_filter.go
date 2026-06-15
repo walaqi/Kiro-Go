@@ -3,12 +3,12 @@ package proxy
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"kiro-go/config"
 	"kiro-go/logger"
 )
 
@@ -23,8 +23,10 @@ import (
 //       泄漏工具解析为结构化 tool_use 暂存；流结束时与已见的结构化 toolUseEvent 去重
 //       （同名同参丢弃，避免重复执行）后注入救回。
 //
-// 开关：环境变量 KIRO_TOOL_LEAK_FIX=off 可回退到无过滤直通；
-//       KIRO_TOOL_LEAK_DEBUG=1 打印命中调试日志。
+// 开关：config.json 的 toolLeakFix（默认 true，设 false 回退到无过滤直通）与
+//       toolLeakDebug（默认 false，打印命中调试日志）。环境变量
+//       KIRO_TOOL_LEAK_FIX=off / KIRO_TOOL_LEAK_DEBUG=1 仍可覆盖 config.json，
+//       便于不改配置文件时临时排障（见 config.GetToolLeakFix/GetToolLeakDebug）。
 
 var (
 	invokeRe         = regexp.MustCompile(`(?s)<invoke name="([^"]+)">(.*?)</invoke>`)
@@ -66,10 +68,9 @@ type toolLeakFilter struct {
 }
 
 func newToolLeakFilter() *toolLeakFilter {
-	enabled := strings.ToLower(strings.TrimSpace(os.Getenv("KIRO_TOOL_LEAK_FIX"))) != "off"
 	return &toolLeakFilter{
-		enabled: enabled,
-		debug:   os.Getenv("KIRO_TOOL_LEAK_DEBUG") == "1",
+		enabled: config.GetToolLeakFix(),
+		debug:   config.GetToolLeakDebug(),
 		seen:    make(map[string]bool),
 	}
 }

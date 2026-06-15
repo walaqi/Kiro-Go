@@ -163,6 +163,12 @@ type KiroPayload struct {
 	// in tool_use responses so the client can match them to its tool registry.
 	// Not serialized to the Kiro API request body.
 	ToolNameMap map[string]string `json:"-"`
+
+	// StopSequences are the client-supplied stop sequences. Kiro's upstream API
+	// has no stop parameter, so these are enforced adapter-side: the response
+	// stream is scanned and truncated when a sequence is generated. Not
+	// serialized to the Kiro API request body.
+	StopSequences []string `json:"-"`
 }
 
 type KiroUserInputMessage struct {
@@ -239,6 +245,13 @@ type KiroStreamCallback struct {
 	OnError        func(err error)
 	OnCredits      func(credits float64)
 	OnContextUsage func(percentage float64)
+
+	// OnStopSequence fires when adapter-side stop-sequence detection halts the
+	// stream. matched is the client-supplied sequence that triggered the stop.
+	// Consumers use it to report stop_reason="stop_sequence" with the matched
+	// value. Kiro's upstream API has no stop parameter, so this is enforced
+	// locally by scanning emitted text.
+	OnStopSequence func(matched string)
 }
 
 // ==================== API Call ====================
@@ -392,7 +405,11 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 			continue
 		}
 
-		err = parseEventStream(resp.Body, callback)
+		var stopSequences []string
+		if payload != nil {
+			stopSequences = payload.StopSequences
+		}
+		err = parseEventStream(resp.Body, stopSequences, callback)
 		resp.Body.Close()
 		return err
 	}
@@ -406,7 +423,13 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 // ==================== Event Stream Parsing ====================
 
 // parseEventStream decodes an AWS binary Event Stream response body.
-func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
+//
+// stopSequences are the client-supplied stop sequences enforced adapter-side
+// (Kiro's upstream API has no stop parameter): visible text is scanned as it
+// streams, and on the first full match the response is truncated there, the
+// remainder discarded, and OnStopSequence fired so callers can report
+// stop_reason=stop_sequence. Pass nil to disable.
+func parseEventStream(body io.Reader, stopSequences []string, callback *KiroStreamCallback) error {
 	if callback == nil {
 		callback = &KiroStreamCallback{}
 	}
@@ -425,6 +448,34 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 			}
 		}
 		callback = &cbCopy
+	}
+
+	// Stop-sequence adapter-side enforcement. Visible (non-thinking) text is
+	// routed through emitVisibleText so the filter can truncate at the first
+	// match; thinking text is exempt (Anthropic stop_sequences apply to the
+	// generated answer, not the reasoning trace).
+	stopFilter := newStopSequenceFilter(stopSequences)
+	stopHit := false
+	emitVisibleText := func(s string) {
+		if s == "" || stopHit {
+			return
+		}
+		if !stopFilter.active() {
+			if callback.OnText != nil {
+				callback.OnText(s, false)
+			}
+			return
+		}
+		out := stopFilter.feed(s)
+		if out != "" && callback.OnText != nil {
+			callback.OnText(out, false)
+		}
+		if stopFilter.stopped {
+			stopHit = true
+			if callback.OnStopSequence != nil {
+				callback.OnStopSequence(stopFilter.matched)
+			}
+		}
 	}
 
 	// Read directly without bufio to avoid buffering latency in streaming responses.
@@ -485,27 +536,33 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 				if normalized != "" {
 					if leakFilter.enabled {
 						// Cross-frame filter: split normal text from leaked tool-call XML.
+						// Clean text is routed through the stop-sequence filter.
 						leakFilter.carry += normalized
-						leakFilter.process(false, func(s string) {
-							if callback.OnText != nil {
-								callback.OnText(s, false)
-							}
-						})
-					} else if callback.OnText != nil {
-						callback.OnText(normalized, false)
+						leakFilter.process(false, emitVisibleText)
+					} else {
+						emitVisibleText(normalized)
 					}
 				}
 			}
 		case "reasoningContentEvent":
-			if text, ok := event["text"].(string); ok && text != "" {
+			// A matched stop sequence truncates the visible answer; reasoning that
+			// arrives after the cut is discarded along with it.
+			if text, ok := event["text"].(string); ok && text != "" && !stopHit {
 				normalized := normalizeChunk(text, &lastReasoningContent)
 				if normalized != "" && callback.OnText != nil {
 					callback.OnText(normalized, true)
 				}
 			}
 		case "toolUseEvent":
-			currentToolUse = handleToolUseEvent(event, currentToolUse, callback)
+			// After a stop-sequence cut, structured tool calls at or past the cut
+			// point are discarded (the response ended at the matched sequence).
+			if !stopHit {
+				currentToolUse = handleToolUseEvent(event, currentToolUse, callback)
+			}
 		case "meteringEvent":
+			// Credits reflect the upstream's real work and are billed regardless
+			// of where we truncate the displayed response, so they are always
+			// accumulated even after a stop-sequence hit.
 			if usage, ok := event["usage"].(float64); ok {
 				totalCredits += usage
 			}
@@ -516,21 +573,38 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 				}
 			}
 		}
+
+		// NOTE: we intentionally do NOT break the read loop on a stop-sequence
+		// hit. Kiro emits meteringEvent (credits) and usage at the END of the
+		// stream; breaking early would lose them. Instead, stopHit guards above
+		// suppress further visible content while metering/usage keep flowing.
 	}
 
-	if currentToolUse != nil {
-		finishToolUse(currentToolUse, callback)
-	}
+	// On a stop-sequence hit the response is truncated at the match: an
+	// in-progress structured tool call and any leaked-tool rescue are part of
+	// the discarded tail. Only finalize them when no stop sequence fired.
+	if !stopHit {
+		if currentToolUse != nil {
+			finishToolUse(currentToolUse, callback)
+		}
 
-	// Tool-call XML leak fix: flush any residual carry as text, then inject the
-	// rescued leaked tools (deduplicated against structured tool_use already seen).
-	if leakFilter.enabled {
-		leakFilter.process(true, func(s string) {
-			if callback.OnText != nil {
-				callback.OnText(s, false)
+		// Tool-call XML leak fix: flush any residual carry as text, then inject the
+		// rescued leaked tools (deduplicated against structured tool_use already seen).
+		if leakFilter.enabled {
+			leakFilter.process(true, func(s string) {
+				emitVisibleText(s)
+			})
+			leakFilter.injectLeaked(callback)
+		}
+
+		// Flush any text the stop-sequence filter held back as a potential
+		// partial match. Since no sequence fired (!stopHit), that tail was real
+		// text and must not be dropped.
+		if stopFilter.active() && !stopHit {
+			if tail := stopFilter.flush(); tail != "" && callback.OnText != nil {
+				callback.OnText(tail, false)
 			}
-		})
-		leakFilter.injectLeaked(callback)
+		}
 	}
 
 	if callback.OnCredits != nil && totalCredits > 0 {
