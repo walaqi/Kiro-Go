@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 )
@@ -229,6 +230,17 @@ type Config struct {
 	// usage quota has been exhausted. When enabled, the pool will not skip accounts
 	// solely because usageCurrent >= usageLimit.
 	AllowOverUsage bool `json:"allowOverUsage,omitempty"`
+
+	// ToolLeakFix controls the cross-frame filter that rescues tool-call XML the
+	// Kiro backend occasionally leaks into assistant text (see proxy/tool_leak_filter.go).
+	// Defaults to true. Set to false to fall back to passing assistant text through
+	// unfiltered. The KIRO_TOOL_LEAK_FIX env var, when set, overrides this.
+	ToolLeakFix *bool `json:"toolLeakFix,omitempty"`
+
+	// ToolLeakDebug enables verbose logging for the tool-call XML leak filter
+	// (per-leak parse logs and forced rescue/dedup stats). Defaults to false.
+	// The KIRO_TOOL_LEAK_DEBUG=1 env var, when set, forces this on.
+	ToolLeakDebug bool `json:"toolLeakDebug,omitempty"`
 
 	// CreditsToUSD is the conversion constant from upstream Kiro credits to USD,
 	// used to calibrate the reported output / cache_read / cache_creation token
@@ -948,6 +960,43 @@ func UpdateAllowOverUsage(allow bool) error {
 	defer cfgLock.Unlock()
 	cfg.AllowOverUsage = allow
 	return Save()
+}
+
+// GetToolLeakFix returns whether the tool-call XML leak filter is enabled.
+// Defaults to true. The KIRO_TOOL_LEAK_FIX env var overrides config.json when
+// set: "off" disables, any other value enables.
+func GetToolLeakFix() bool {
+	if env := strings.TrimSpace(os.Getenv("KIRO_TOOL_LEAK_FIX")); env != "" {
+		return strings.ToLower(env) != "off"
+	}
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.ToolLeakFix == nil {
+		return true
+	}
+	return *cfg.ToolLeakFix
+}
+
+// UpdateToolLeakFix sets the tool-call XML leak filter switch and persists it.
+func UpdateToolLeakFix(enabled bool) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.ToolLeakFix = &enabled
+	return Save()
+}
+
+// GetToolLeakDebug returns whether verbose logging for the leak filter is on.
+// Defaults to false. KIRO_TOOL_LEAK_DEBUG=1 forces it on regardless of config.
+func GetToolLeakDebug() bool {
+	if os.Getenv("KIRO_TOOL_LEAK_DEBUG") == "1" {
+		return true
+	}
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return false
+	}
+	return cfg.ToolLeakDebug
 }
 
 // GetCreditsToUSD returns the conversion constant used to translate upstream
