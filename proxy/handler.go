@@ -1200,6 +1200,14 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		err := CallKiroAPI(account, payload, callback)
 		if err != nil {
 			lastErr = err
+			if isMalformedRequestErrorMessage(err.Error()) {
+				// Permanent request-structure error (HTTP 400): the same payload
+				// fails on every account and endpoint. Do not rotate accounts or
+				// penalize this one — that would burn upstream credits and cool
+				// down healthy accounts. Break and surface the 400 so the client
+				// stops retrying.
+				break
+			}
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			if !messageStarted {
@@ -1279,6 +1287,15 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 
 	if lastErr == nil {
 		h.sendClaudeError(w, 503, "api_error", "No available accounts")
+		return
+	}
+
+	if isMalformedRequestErrorMessage(lastErr.Error()) {
+		// Client-side request-structure error: return 400 so the client stops
+		// retrying (a 500 would trigger client-side retries that re-amplify the
+		// failure across the account pool and burn upstream credits). Not counted
+		// as a proxy failure.
+		h.sendClaudeError(w, 400, "invalid_request_error", lastErr.Error())
 		return
 	}
 
@@ -1410,6 +1427,11 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		err := CallKiroAPI(account, payload, callback)
 		if err != nil {
 			lastErr = err
+			if isMalformedRequestErrorMessage(err.Error()) {
+				// Permanent request-structure error (HTTP 400): retrying on another
+				// account/endpoint cannot succeed and only burns credits. Fail fast.
+				break
+			}
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			continue
@@ -1487,6 +1509,13 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 
 	if lastErr == nil {
 		h.sendClaudeError(w, 503, "api_error", "No available accounts")
+		return
+	}
+
+	if isMalformedRequestErrorMessage(lastErr.Error()) {
+		// Client-side request-structure error: return 400 so the client stops
+		// retrying instead of re-amplifying across the account pool. Not a proxy failure.
+		h.sendClaudeError(w, 400, "invalid_request_error", lastErr.Error())
 		return
 	}
 
@@ -1883,6 +1912,13 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		err := CallKiroAPI(account, payload, callback)
 		if err != nil {
 			lastErr = err
+			if isMalformedRequestErrorMessage(err.Error()) {
+				// Permanent request-structure error (HTTP 400): the same payload
+				// fails on every account and endpoint. Do not rotate accounts or
+				// penalize this one. Break and surface the 400 so the client stops
+				// retrying.
+				break
+			}
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			if !responseStarted {
@@ -1953,6 +1989,13 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		return
 	}
 
+	if isMalformedRequestErrorMessage(lastErr.Error()) {
+		// Client-side request-structure error: return 400 so the client stops
+		// retrying instead of re-amplifying across the account pool. Not a proxy failure.
+		h.sendOpenAIError(w, 400, "invalid_request_error", lastErr.Error())
+		return
+	}
+
 	h.recordFailure()
 	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 }
@@ -2000,6 +2043,11 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		err := CallKiroAPI(account, payload, callback)
 		if err != nil {
 			lastErr = err
+			if isMalformedRequestErrorMessage(err.Error()) {
+				// Permanent request-structure error (HTTP 400): retrying on another
+				// account/endpoint cannot succeed and only burns credits. Fail fast.
+				break
+			}
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			continue
@@ -2032,6 +2080,13 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 
 	if lastErr == nil {
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
+		return
+	}
+
+	if isMalformedRequestErrorMessage(lastErr.Error()) {
+		// Client-side request-structure error: return 400 so the client stops
+		// retrying instead of re-amplifying across the account pool. Not a proxy failure.
+		h.sendOpenAIError(w, 400, "invalid_request_error", lastErr.Error())
 		return
 	}
 

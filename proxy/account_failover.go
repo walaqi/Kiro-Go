@@ -45,6 +45,18 @@ func isAuthErrorMessage(msg string) bool {
 		strings.Contains(msg, "refresh token expired")
 }
 
+// isMalformedRequestErrorMessage reports whether the upstream rejected the
+// request because of the request body itself (HTTP 400 "Improperly formed
+// request."), not because of the account or endpoint. Such failures are
+// permanent for the given payload: retrying on another account or endpoint
+// cannot succeed and only burns upstream credits. Callers must fail the request
+// immediately instead of rotating accounts.
+func isMalformedRequestErrorMessage(msg string) bool {
+	msg = strings.ToLower(msg)
+	return strings.Contains(msg, "http 400") ||
+		strings.Contains(msg, "improperly formed request")
+}
+
 func (h *Handler) disableAccount(account *config.Account, banStatus, banReason string) {
 	if account == nil {
 		return
