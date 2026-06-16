@@ -14,6 +14,11 @@ import (
 // After the fix, assistant history turns must never contain tool-invocation
 // syntax. Tool identity is attributed only on the user "Tool results" side.
 func TestNoToolInvocationTextInAssistantHistory(t *testing.T) {
+	// This guards the flatten fallback, which strips structured toolUses and
+	// attributes results on the user side. The default preserve path keeps the
+	// structured pairs intact instead; see
+	// TestClaudeToKiroPreservesStructuredToolHistory.
+	t.Setenv("KIRO_PRESERVE_TOOL_HISTORY", "off")
 	// Build a long OpenAI conversation with many completed tool cycles.
 	msgs := []OpenAIMessage{{Role: "user", Content: "start a multi-step task"}}
 	for i := 0; i < 8; i++ {
@@ -79,6 +84,7 @@ func newPollToolCall(id, name, args string) ToolCall {
 // are dropped, those identical user "Tool results" turns become adjacent
 // duplicates; the proxy collapses each run to a single copy.
 func TestCollapsesConsecutiveIdenticalToolResults(t *testing.T) {
+	t.Setenv("KIRO_PRESERVE_TOOL_HISTORY", "off")
 	msgs := []OpenAIMessage{{Role: "user", Content: "start"}}
 	// 5 identical failing cycles in a row (model retrying the same tool).
 	for i := 0; i < 5; i++ {

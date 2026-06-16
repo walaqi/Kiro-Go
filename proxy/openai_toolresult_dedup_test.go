@@ -10,7 +10,11 @@ import (
 // "Tool results:" continuation text AND kept the structured ToolResults, which
 // sanitizeKiroHistory then narrated again, producing the same output twice.
 // Each tool result's output must appear exactly once in history.
+//
+// This is a flatten-path concern (the preserve path keeps results structured
+// rather than narrating them to text), so it pins the strategy off.
 func TestOpenAIToKiroDoesNotDuplicateToolResultText(t *testing.T) {
+	t.Setenv("KIRO_PRESERVE_TOOL_HISTORY", "off")
 	req := &OpenAIRequest{
 		Model: "claude-opus-4.8",
 		Messages: []OpenAIMessage{

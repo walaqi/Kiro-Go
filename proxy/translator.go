@@ -1442,6 +1442,29 @@ func currentToolResultsMatchLastAssistant(history []KiroHistoryMessage, currentT
 	return true
 }
 
+// answeringToolResultIDs returns the set of toolUseId values that answer the
+// assistant turn at history index i. An assistant turn is answered by the
+// immediately following user turn's toolResults; the final assistant turn is
+// answered by the current (outgoing) message's toolResults instead, since its
+// answering user turn has not yet entered history.
+func answeringToolResultIDs(history []KiroHistoryMessage, i int, currentToolResultIDs map[string]bool) map[string]bool {
+	if i+1 < len(history) {
+		next := history[i+1].UserInputMessage
+		if next != nil && next.UserInputMessageContext != nil && len(next.UserInputMessageContext.ToolResults) > 0 {
+			ids := make(map[string]bool, len(next.UserInputMessageContext.ToolResults))
+			for _, tr := range next.UserInputMessageContext.ToolResults {
+				ids[tr.ToolUseID] = true
+			}
+			return ids
+		}
+		// A following turn exists but carries no tool results: the call is
+		// unanswered within history.
+		return nil
+	}
+	// Final assistant turn: answered by the current message, if at all.
+	return currentToolResultIDs
+}
+
 // pollutedToolCallTextPattern matches the legacy "[Called tool X with input ...]"
 // / "[Called tool X]" narration that an earlier version of this proxy wrote into
 // assistant turns. Models trained on that in-context text began emitting it as
@@ -1516,16 +1539,223 @@ func joinHistoryText(existing, narrated string) string {
 	}
 }
 
-// sanitizeKiroHistory flattens structured tool calls/results inside history into
-// plain text, leaving at most one active structured tool turn intact: the final
-// history assistant message whose tool-use IDs are answered by the current
-// message's toolResults. Everything else is narrated as text so the upstream
-// accepts the request.
+// sanitizeKiroHistory normalizes structured tool calls/results in history so the
+// upstream accepts the request. It dispatches between two strategies:
+//
+//   - Preserve (default): keep structured tool pairs intact, matching what the
+//     real Kiro IDE client sends. This is the root-cause fix for transcript-leak
+//     imitation, but relies on the upstream accepting many structured pairs from
+//     this proxy (verified for the real client; inferred for the proxy).
+//   - Flatten (fallback): the original behavior — keep at most one active
+//     structured pair and narrate the rest to text. Conservative and proven, but
+//     it seeds the history with mimicable "Tool results:" text.
+//
+// The strategy is selected by config.GetPreserveToolHistory() so a deployment
+// can fall back instantly (config flag or env override) if the upstream turns
+// out to reject the preserved-structure payload, without a new release.
+func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[string]bool) []KiroHistoryMessage {
+	if config.GetPreserveToolHistory() {
+		return sanitizeKiroHistoryPreserve(history, currentToolResultIDs)
+	}
+	return sanitizeKiroHistoryFlatten(history, currentToolResultIDs)
+}
+
+// sanitizeKiroHistoryPreserve keeps structured tool calls/results in history
+// intact whenever they form a complete pair, matching what the real Kiro IDE
+// client sends upstream (an assistant turn's toolUses answered by the very next
+// user turn's toolResults). Real packet captures show the upstream accepts dozens
+// of such structured pairs in one request, so flattening them is unnecessary —
+// and harmful: flattening renders every result as "Tool results:\n[tool] ..."
+// text, seeding the history with many in-context examples that the model then
+// imitates by emitting that transcript as visible output.
+//
+// Only UNPAIRED structured tool activity is degraded, because the upstream
+// rejects a request whose structured toolUses/toolResults do not line up:
+//   - An assistant toolUse with no answering user toolResults (orphaned call,
+//     e.g. the result turn was dropped by context compaction) has its toolUses
+//     stripped. Its natural-language content is kept; the bare intent to call is
+//     low-value and is discarded without any mimicable narration.
+//   - A user toolResults with no preceding toolUse (orphaned result) is narrated
+//     to text so its real data (file contents, search output) is not lost. These
+//     occur only at compaction boundaries (0–1 per request), far too few to seed
+//     few-shot imitation.
 //
 // currentToolResultIDs is the set of toolUseId values carried by the current
-// (outgoing) message. When the last history entry is an assistant message whose
-// tool uses are fully covered by that set, its structured toolUses are kept.
-func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[string]bool) []KiroHistoryMessage {
+// (outgoing) message. The final history assistant turn answered by those IDs is
+// the "active" pair completed by the current message, so its toolUses stay
+// structured even though its answering toolResults live outside history.
+func sanitizeKiroHistoryPreserve(history []KiroHistoryMessage, currentToolResultIDs map[string]bool) []KiroHistoryMessage {
+	if len(history) == 0 {
+		return history
+	}
+
+	// Map every tool-use ID to its tool name across all assistant turns, so an
+	// orphaned user "Tool results" turn can still attribute each result to its
+	// originating tool when it has to be narrated to text.
+	toolNames := make(map[string]string)
+	for i := range history {
+		if a := history[i].AssistantResponseMessage; a != nil {
+			for _, tu := range a.ToolUses {
+				if tu.ToolUseID != "" && tu.Name != "" {
+					toolNames[tu.ToolUseID] = tu.Name
+				}
+			}
+		}
+	}
+
+	// Decide, per assistant turn, whether its structured toolUses are answered.
+	// An assistant turn at index i is answered when every one of its toolUse IDs
+	// appears either in the immediately following user turn's toolResults, or —
+	// for the final assistant turn — in the current message's toolResults.
+	keepAssistantStructured := make([]bool, len(history))
+	for i := range history {
+		a := history[i].AssistantResponseMessage
+		if a == nil || len(a.ToolUses) == 0 {
+			continue
+		}
+		answerIDs := answeringToolResultIDs(history, i, currentToolResultIDs)
+		allCovered := true
+		for _, tu := range a.ToolUses {
+			if !answerIDs[tu.ToolUseID] {
+				allCovered = false
+				break
+			}
+		}
+		keepAssistantStructured[i] = allCovered
+	}
+
+	// A user turn's structured toolResults are kept only when the immediately
+	// preceding assistant turn issued the matching toolUses AND we are keeping
+	// that assistant turn structured. Otherwise the results are orphaned and must
+	// be narrated to text so the upstream does not reject the unpaired structure.
+	keepUserStructured := make([]bool, len(history))
+	for i := range history {
+		u := history[i].UserInputMessage
+		if u == nil || u.UserInputMessageContext == nil || len(u.UserInputMessageContext.ToolResults) == 0 {
+			continue
+		}
+		if i == 0 || !keepAssistantStructured[i-1] {
+			continue
+		}
+		prev := history[i-1].AssistantResponseMessage
+		if prev == nil || len(prev.ToolUses) == 0 {
+			continue
+		}
+		callIDs := make(map[string]bool, len(prev.ToolUses))
+		for _, tu := range prev.ToolUses {
+			callIDs[tu.ToolUseID] = true
+		}
+		allMatched := true
+		for _, tr := range u.UserInputMessageContext.ToolResults {
+			if !callIDs[tr.ToolUseID] {
+				allMatched = false
+				break
+			}
+		}
+		keepUserStructured[i] = allMatched
+	}
+
+	for i := range history {
+		msg := &history[i]
+
+		if msg.AssistantResponseMessage != nil {
+			// Scrub legacy tool-call narration that a polluted client may be
+			// replaying as assistant text, so we neither reinforce the pattern
+			// nor leave it for the model to imitate.
+			if msg.AssistantResponseMessage.Content != "" {
+				msg.AssistantResponseMessage.Content = stripPollutedToolCallText(msg.AssistantResponseMessage.Content)
+			}
+		}
+
+		if msg.AssistantResponseMessage != nil && len(msg.AssistantResponseMessage.ToolUses) > 0 && !keepAssistantStructured[i] {
+			// Orphaned tool call (no answering results survive). Drop the
+			// structured toolUses WITHOUT writing any tool-invocation text into
+			// the assistant turn: narrating the call here would give the model
+			// in-context examples of "invoke a tool by emitting this text", which
+			// it then imitates instead of issuing real structured tool calls.
+			msg.AssistantResponseMessage.ToolUses = nil
+		}
+
+		if msg.UserInputMessage != nil && msg.UserInputMessage.UserInputMessageContext != nil {
+			ctx := msg.UserInputMessage.UserInputMessageContext
+			if len(ctx.ToolResults) > 0 && !keepUserStructured[i] {
+				// Orphaned results: preserve their data as narrated text.
+				narrated := narrateToolResults(ctx.ToolResults, toolNames)
+				msg.UserInputMessage.Content = joinHistoryText(msg.UserInputMessage.Content, narrated)
+				ctx.ToolResults = nil
+			}
+			// History user turns must never carry structured tool specs.
+			ctx.Tools = nil
+			if len(ctx.Tools) == 0 && len(ctx.ToolResults) == 0 {
+				msg.UserInputMessage.UserInputMessageContext = nil
+			}
+		}
+
+		// After scrubbing, an assistant turn that held only tool-call text (or
+		// only orphaned structured tool calls) is now empty. Do NOT backfill it
+		// with a placeholder like ".": replayed across a long history that
+		// produces dozens of "." assistant turns, which the model then imitates
+		// by replying ".". Mark such turns for removal instead. A user turn whose
+		// structured toolResults we kept may legitimately be empty (the real Kiro
+		// client sends content_len=0 for tool-result turns), so only backfill
+		// when there is nothing structured left to carry it.
+		if msg.UserInputMessage != nil &&
+			strings.TrimSpace(msg.UserInputMessage.Content) == "" &&
+			len(msg.UserInputMessage.Images) == 0 &&
+			!keepUserStructured[i] {
+			msg.UserInputMessage.Content = minimalFallbackUserContent
+		}
+	}
+
+	// Second pass: drop assistant turns that carry no real content — either left
+	// empty by scrubbing, or consisting solely of the "." placeholder that an
+	// earlier version emitted (and that a polluted client now replays). Their
+	// tool activity already survives as narrated text in the adjacent user
+	// "Tool results" turn, so removing the hollow assistant turn loses no
+	// information and avoids seeding mimicable empty/"." turns.
+	cleaned := history[:0:0]
+	for i := range history {
+		msg := history[i]
+		if msg.AssistantResponseMessage != nil && len(msg.AssistantResponseMessage.ToolUses) == 0 {
+			c := strings.TrimSpace(msg.AssistantResponseMessage.Content)
+			if c == "" || c == minimalFallbackUserContent {
+				continue // drop hollow assistant turn
+			}
+		}
+		// Collapse runs of consecutive identical user "Tool results" turns. A
+		// client stuck in a retry loop (e.g. the same tool error 100+ times)
+		// sends many identical tool results; once the hollow assistant turns
+		// between them are dropped they become adjacent duplicates that waste
+		// context and form a repetitive pattern. Keep one copy of each run.
+		if msg.UserInputMessage != nil && len(cleaned) > 0 {
+			last := cleaned[len(cleaned)-1]
+			if last.UserInputMessage != nil &&
+				strings.TrimSpace(last.UserInputMessage.Content) == strings.TrimSpace(msg.UserInputMessage.Content) &&
+				strings.TrimSpace(msg.UserInputMessage.Content) != "" &&
+				len(msg.UserInputMessage.Images) == 0 {
+				continue // skip duplicate consecutive user turn
+			}
+		}
+		cleaned = append(cleaned, msg)
+	}
+
+	// Dropping hollow assistant turns can leave history starting with an
+	// assistant message; re-trim so it begins with a user turn.
+	return trimLeadingAssistantHistory(cleaned)
+}
+
+// sanitizeKiroHistoryFlatten is the legacy fallback: it flattens structured tool
+// calls/results inside history into plain text, leaving at most one active
+// structured tool turn intact (the final history assistant message whose
+// tool-use IDs are answered by the current message's toolResults). Everything
+// else is narrated as text.
+//
+// This is retained behind the PreserveStructuredToolHistory switch so a
+// deployment can revert to it instantly (config flag or KIRO_PRESERVE_TOOL_HISTORY=off)
+// if the upstream is found to reject multi-pair structured history. The
+// preserve path (sanitizeKiroHistoryPreserve) is the default; this exists only
+// as a one-restart escape hatch.
+func sanitizeKiroHistoryFlatten(history []KiroHistoryMessage, currentToolResultIDs map[string]bool) []KiroHistoryMessage {
 	if len(history) == 0 {
 		return history
 	}

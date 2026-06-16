@@ -9,9 +9,14 @@ import (
 // compaction scenario that triggered upstream HTTP 400 "Improperly formed
 // request": a long conversation whose history contains completed tool cycles
 // (assistant tool_use + user tool_result), followed by a plain-text instruction.
-// The generated payload must NOT carry any structured toolUses/toolResults in
-// history, since Kiro's upstream rejects those.
+// In the FLATTEN fallback, the generated payload must NOT carry any structured
+// toolUses/toolResults in history.
+//
+// This guards the flatten fallback specifically, so it pins the strategy off.
+// The default preserve strategy intentionally keeps these pairs structured; see
+// TestClaudeToKiroPreservesStructuredToolHistory.
 func TestClaudeToKiroFlattensHistoryToolCyclesForCompaction(t *testing.T) {
+	t.Setenv("KIRO_PRESERVE_TOOL_HISTORY", "off")
 	req := &ClaudeRequest{
 		Model: "claude-opus-4.8",
 		Messages: []ClaudeMessage{

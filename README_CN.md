@@ -111,7 +111,11 @@ curl http://localhost:8080/v1/chat/completions \
 | 变量 | 说明 | 默认值 |
 |-----|------|-------|
 | `CONFIG_PATH` | 配置文件路径 | `data/config.json` |
-| `ADMIN_PASSWORD` | 管理面板密码（覆盖配置文件） | - |
+| `ADMIN_PASSWORD` | 管理面板密码（覆盖配置文件中的设置） | - |
+| `LOG_LEVEL` | 日志级别，可选 `debug` / `info` / `warn` / `error` | `info` |
+| `KIRO_TOOL_LEAK_FIX` | 工具调用 XML 泄漏过滤开关，覆盖 `config.json`。设为 `off` 关闭，其他任意值开启 | 开启 |
+| `KIRO_TOOL_LEAK_DEBUG` | 泄漏过滤器的详细调试日志。设为 `1` 强制开启（无视配置文件） | 关闭 |
+| `KIRO_PRESERVE_TOOL_HISTORY` | 保留结构化工具调用/结果历史的开关，覆盖 `config.json`。设为 `off` 回退到扁平化文本（兜底方案），其他任意值开启 | 开启 |
 
 ## 参与贡献
 
