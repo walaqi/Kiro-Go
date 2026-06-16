@@ -54,7 +54,7 @@ const toolResultImagePlaceholder = "[Tool returned an image; the image is attach
 // message) and insert a placeholder note so the model knows context was elided.
 // The limit is kept conservatively below the observed upstream threshold to
 // leave room for headers and minor serialization overhead.
-const maxPayloadBytes = 900 * 1024
+const maxPayloadBytes = 1500 * 1024
 
 // truncationPlaceholder is inserted in history where older turns were dropped to
 // fit within maxPayloadBytes.
@@ -1946,11 +1946,44 @@ func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
 
 	rebuilt := make([]KiroHistoryMessage, 0, len(priming)+1+len(tail))
 	rebuilt = append(rebuilt, priming...)
-	if keepFrom > 0 { // older turns were dropped → note the elision
+	switch {
+	case keepFrom > 0 && len(tail) > 0 && tail[0].UserInputMessage != nil:
+		// Older turns were dropped → note the elision. Prepend the placeholder
+		// text to the first retained user turn rather than inserting a
+		// standalone placeholder user turn: priming ends with the system-priming
+		// assistant turn and the tail begins with a user turn, so a standalone
+		// placeholder user turn between them would produce two consecutive user
+		// turns (U,U), breaking the strict user/assistant alternation the
+		// upstream expects. Merging keeps the alternation intact.
+		head := tail[0]
+		merged := *head.UserInputMessage
+		merged.Content = joinHistoryText(truncationPlaceholder, merged.Content)
+		head.UserInputMessage = &merged
+		rebuilt = append(rebuilt, head)
+		rebuilt = append(rebuilt, tail[1:]...)
+	case keepFrom > 0:
+		// No leading user turn to merge into (tail empty); fall back to a
+		// standalone placeholder user turn.
 		rebuilt = append(rebuilt, placeholderEntry)
+		rebuilt = append(rebuilt, tail...)
+	default:
+		rebuilt = append(rebuilt, tail...)
 	}
-	rebuilt = append(rebuilt, tail...)
-	payload.ConversationState.History = rebuilt
+
+	// Truncation drops the oldest turns by byte size alone, which can sever a
+	// structured tool pair: an assistant turn that issued toolUses is dropped
+	// while the user turn carrying its answering toolResults survives at the head
+	// of the retained tail. Those orphaned toolResults make the upstream reject
+	// the whole request with "Improperly formed request." (HTTP 400). Re-run the
+	// history sanitizer over the rebuilt history so any pair severed by the cut
+	// is repaired exactly as an inbound orphan would be: orphaned results are
+	// narrated to text, orphaned calls are stripped. currentIDs lets the final
+	// retained assistant turn stay structured if the current message answers it.
+	var currentIDs map[string]bool
+	if ctx := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext; ctx != nil {
+		currentIDs = collectToolResultIDs(ctx.ToolResults)
+	}
+	payload.ConversationState.History = sanitizeKiroHistory(rebuilt, currentIDs)
 
 	// If still too large (current message or retained tail alone exceeds the
 	// limit), shrink the current message content as a last resort.
