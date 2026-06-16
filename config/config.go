@@ -242,6 +242,18 @@ type Config struct {
 	// The KIRO_TOOL_LEAK_DEBUG=1 env var, when set, forces this on.
 	ToolLeakDebug bool `json:"toolLeakDebug,omitempty"`
 
+	// PreserveToolHistory controls how structured tool calls/results in the
+	// conversation history are sent upstream (see proxy/translator.go
+	// sanitizeKiroHistory). When true (the default), complete structured tool
+	// pairs are kept intact, matching what the real Kiro IDE client sends — this
+	// is the root-cause fix for the transcript-leak imitation that flattening
+	// causes. When false, the proxy falls back to the conservative original
+	// behavior: keep at most one active structured pair and narrate the rest to
+	// text. Defaults to true. Set to false (or KIRO_PRESERVE_TOOL_HISTORY=off)
+	// to fall back instantly if the upstream rejects the preserved-structure
+	// payload, without a new release.
+	PreserveToolHistory *bool `json:"preserveToolHistory,omitempty"`
+
 	// CreditsToUSD is the conversion constant from upstream Kiro credits to USD,
 	// used to calibrate the reported output / cache_read / cache_creation token
 	// counts against published model list prices. The target dollar amount for a
@@ -982,6 +994,32 @@ func UpdateToolLeakFix(enabled bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.ToolLeakFix = &enabled
+	return Save()
+}
+
+// GetPreserveToolHistory returns whether structured tool calls/results in
+// history are preserved intact (true) or flattened to text (false). Defaults to
+// true. The KIRO_PRESERVE_TOOL_HISTORY env var overrides config.json when set:
+// "off" forces the conservative flatten fallback, any other value enables
+// preserve. Use the fallback if the upstream is observed to reject requests
+// carrying multiple structured tool pairs.
+func GetPreserveToolHistory() bool {
+	if env := strings.TrimSpace(os.Getenv("KIRO_PRESERVE_TOOL_HISTORY")); env != "" {
+		return strings.ToLower(env) != "off"
+	}
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.PreserveToolHistory == nil {
+		return true
+	}
+	return *cfg.PreserveToolHistory
+}
+
+// UpdatePreserveToolHistory sets the structured-tool-history switch and persists it.
+func UpdatePreserveToolHistory(enabled bool) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.PreserveToolHistory = &enabled
 	return Save()
 }
 
