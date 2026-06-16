@@ -397,8 +397,13 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			lastErr = fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
-			// Authentication errors and payment errors are not retried across endpoints.
-			if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 402 {
+			// 4xx client errors are caused by the request itself (malformed body,
+			// auth, payment), not by the endpoint. Retrying the SAME payload on a
+			// different endpoint cannot succeed and only burns upstream credits, so
+			// fail fast. In particular HTTP 400 "Improperly formed request" must not
+			// fan out across all three endpoints. 5xx (server/transient) still falls
+			// through to try the next endpoint.
+			if resp.StatusCode >= 400 && resp.StatusCode < 500 {
 				return lastErr
 			}
 			logger.Warnf("[KiroAPI] Endpoint %s error: %v", ep.Name, lastErr)
