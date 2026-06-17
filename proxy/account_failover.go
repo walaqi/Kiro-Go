@@ -57,6 +57,51 @@ func isMalformedRequestErrorMessage(msg string) bool {
 		strings.Contains(msg, "improperly formed request")
 }
 
+// Downstream-facing error messages. Internal diagnostic strings (e.g.
+// "quota exhausted on AmazonQ", "all endpoints failed", "No available
+// accounts") must never reach the client — they leak upstream endpoint names
+// and pool internals. These two replacements are the only error texts a
+// downstream client is allowed to see for upstream/pool failures.
+const (
+	// msgServiceCoolingDown is shown when the upstream throttled/exhausted us
+	// (HTTP 429 / "quota" errors). It nudges the client to back off briefly.
+	msgServiceCoolingDown = "SERVICE IS CALLING DOWN. PLEASE TRY AGAIN AFTER 120 SECONDS."
+	// msgServiceUnavailable is shown when no account could serve the request
+	// or an unclassified upstream failure occurred.
+	msgServiceUnavailable = "Service is temporarily unavailable, please try again!"
+)
+
+// classifyDownstreamError maps an internal upstream/pool error into a
+// client-safe (httpStatus, message) pair, guaranteeing no internal diagnostic
+// string leaks downstream. countAsFailure reports whether the caller should
+// record a proxy-level failure (request-structure 400s are the client's fault,
+// not ours, so they are not counted).
+//
+//   - nil (no account available)      -> 503, msgServiceUnavailable
+//   - malformed request (HTTP 400)    -> 400, original detail (safe, client-side)
+//   - quota/429 (upstream throttle)   -> 429, msgServiceCoolingDown
+//   - anything else (5xx, net, etc.)  -> 503, msgServiceUnavailable
+func classifyDownstreamError(err error) (status int, message string, countAsFailure bool) {
+	if err == nil {
+		return 503, msgServiceUnavailable, false
+	}
+	msg := err.Error()
+	if isMalformedRequestErrorMessage(msg) {
+		return 400, msg, false
+	}
+	if isQuotaErrorMessage(msg) {
+		return 429, msgServiceCoolingDown, true
+	}
+	return 503, msgServiceUnavailable, true
+}
+
+// downstreamErrorMessage returns only the client-safe message for an error,
+// for use mid-stream where the HTTP status has already been sent.
+func downstreamErrorMessage(err error) string {
+	_, msg, _ := classifyDownstreamError(err)
+	return msg
+}
+
 func (h *Handler) disableAccount(account *config.Account, banStatus, banReason string) {
 	if account == nil {
 		return
