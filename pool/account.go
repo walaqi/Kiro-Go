@@ -1,12 +1,12 @@
 // Package pool 账号池管理
-// 实现轮询负载均衡、错误冷却、Token 刷新
+// 实现优先级负载均衡、错误冷却、Token 刷新
 package pool
 
 import (
 	"kiro-go/config"
+	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -15,9 +15,8 @@ const tokenRefreshSkewSeconds int64 = 120
 // AccountPool 账号池
 type AccountPool struct {
 	mu            sync.RWMutex
-	accounts      []config.Account
+	accounts      []config.Account // 按权重降序排列（优先级高的在前）
 	totalAccounts int
-	currentIndex  uint64
 	cooldowns     map[string]time.Time       // 账号冷却时间
 	errorCounts   map[string]int             // 连续错误计数
 	modelLists    map[string]map[string]bool // accountID → set of modelIDs (from ListAvailableModels)
@@ -41,8 +40,7 @@ func GetPool() *AccountPool {
 	return pool
 }
 
-// Reload rebuilds the weighted account list from config.
-// Weight <= 1 → 1 entry; weight >= 2 → weight entries.
+// Reload rebuilds the account list from config, sorted by weight descending.
 // Over-quota accounts are dropped unless either the per-account upstream
 // Overages switch (OverageStatus=ENABLED) or the global AllowOverUsage
 // setting permits over-quota routing.
@@ -51,17 +49,17 @@ func (p *AccountPool) Reload() {
 	defer p.mu.Unlock()
 	enabled := config.GetEnabledAccounts()
 	allowOverUsage := config.GetAllowOverUsage()
-	var weighted []config.Account
+	var filtered []config.Account
 	for _, a := range enabled {
 		if isQuotaBlocked(a, allowOverUsage) {
 			continue
 		}
-		w := effectiveWeight(a.Weight)
-		for j := 0; j < w; j++ {
-			weighted = append(weighted, a)
-		}
+		filtered = append(filtered, a)
 	}
-	p.accounts = weighted
+	sort.SliceStable(filtered, func(i, j int) bool {
+		return effectiveWeight(filtered[i].Weight) > effectiveWeight(filtered[j].Weight)
+	})
+	p.accounts = filtered
 	p.totalAccounts = len(enabled)
 }
 
@@ -70,7 +68,8 @@ func (p *AccountPool) GetNext() *config.Account {
 	return p.GetNextExcluding(nil)
 }
 
-// GetNextExcluding 获取下一个可用账号（加权轮询），并跳过指定账号。
+// GetNextExcluding 获取优先级最高的可用账号，并跳过指定账号。
+// 账号已按权重降序排列，从头扫描返回第一个满足条件的。
 func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -81,44 +80,26 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 
 	allowOverUsage := config.GetAllowOverUsage()
 	now := time.Now()
-	n := len(p.accounts)
-	seen := make(map[string]bool)
 
-	// 加权轮询查找可用账号
-	for i := 0; i < n; i++ {
-		idx := atomic.AddUint64(&p.currentIndex, 1) % uint64(n)
-		acc := &p.accounts[idx]
+	for i := range p.accounts {
+		acc := &p.accounts[i]
 
 		if excluded != nil && excluded[acc.ID] {
-			seen[acc.ID] = true
 			continue
 		}
-		if seen[acc.ID] {
-			continue
-		}
-
-		// 跳过冷却中的账号
 		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
-			seen[acc.ID] = true
 			continue
 		}
-
-		// 跳过即将过期的 Token
 		if acc.ExpiresAt > 0 && time.Now().Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
-			seen[acc.ID] = true
 			continue
 		}
-
-		// Skip accounts whose quota is exhausted, unless overrides apply.
 		if isQuotaBlocked(*acc, allowOverUsage) {
-			seen[acc.ID] = true
 			continue
 		}
-
 		return acc
 	}
 
-		// 无可用账号，返回冷却时间最短的（排除额度用尽的，除非允许超额）
+	// 无可用账号，返回冷却时间最短的（排除额度用尽的，除非允许超额）
 	var best *config.Account
 	var earliest time.Time
 	for i := range p.accounts {
@@ -185,7 +166,7 @@ func (p *AccountPool) GetNextForModel(model string) *config.Account {
 	return p.GetNextForModelExcluding(model, nil)
 }
 
-// GetNextForModelExcluding 获取下一个支持指定模型的可用账号，并跳过指定账号。
+// GetNextForModelExcluding 获取优先级最高且支持指定模型的可用账号，并跳过指定账号。
 func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string]bool) *config.Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -196,34 +177,23 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 
 	allowOverUsage := config.GetAllowOverUsage()
 	now := time.Now()
-	n := len(p.accounts)
-	seen := make(map[string]bool)
 
-	for i := 0; i < n; i++ {
-		idx := atomic.AddUint64(&p.currentIndex, 1) % uint64(n)
-		acc := &p.accounts[idx]
+	for i := range p.accounts {
+		acc := &p.accounts[i]
 
 		if excluded != nil && excluded[acc.ID] {
-			seen[acc.ID] = true
-			continue
-		}
-		if seen[acc.ID] {
 			continue
 		}
 		if !p.accountHasModel(acc.ID, model) {
-			seen[acc.ID] = true
 			continue
 		}
 		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
-			seen[acc.ID] = true
 			continue
 		}
 		if acc.ExpiresAt > 0 && time.Now().Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
-			seen[acc.ID] = true
 			continue
 		}
 		if isQuotaBlocked(*acc, allowOverUsage) {
-			seen[acc.ID] = true
 			continue
 		}
 		return acc

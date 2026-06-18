@@ -243,10 +243,9 @@ func TestGetNextExcludingSkipsExcludedAccount(t *testing.T) {
 			{ID: "a", Enabled: true},
 			{ID: "b", Enabled: true},
 		},
-		cooldowns:    make(map[string]time.Time),
-		errorCounts:  make(map[string]int),
-		modelLists:   make(map[string]map[string]bool),
-		currentIndex: ^uint64(0),
+		cooldowns:   make(map[string]time.Time),
+		errorCounts: make(map[string]int),
+		modelLists:  make(map[string]map[string]bool),
 	}
 
 	acc := p.GetNextExcluding(map[string]bool{"a": true})
@@ -261,10 +260,9 @@ func TestGetNextForModelExcludingSkipsExcludedAccount(t *testing.T) {
 			{ID: "a", Enabled: true},
 			{ID: "b", Enabled: true},
 		},
-		cooldowns:    make(map[string]time.Time),
-		errorCounts:  make(map[string]int),
-		modelLists:   make(map[string]map[string]bool),
-		currentIndex: ^uint64(0),
+		cooldowns:   make(map[string]time.Time),
+		errorCounts: make(map[string]int),
+		modelLists:  make(map[string]map[string]bool),
 	}
 	p.SetModelList("a", []string{"claude-sonnet-4.5"})
 	p.SetModelList("b", []string{"claude-sonnet-4.5"})
