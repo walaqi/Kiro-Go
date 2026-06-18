@@ -31,6 +31,32 @@ func TestResolveProfileArnReturnsCachedValueWithoutRequest(t *testing.T) {
 	}
 }
 
+func TestRegionalizeURLPrefersProfileArnRegion(t *testing.T) {
+	account := &config.Account{
+		Region:     "ap-southeast-1",
+		ProfileArn: "arn:aws:codewhisperer:us-east-1:123456789012:profile/test",
+	}
+
+	rawURL := "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR"
+	if got := regionalizeURL(rawURL, account); got != rawURL {
+		t.Fatalf("expected profile ARN region to keep us-east-1 URL, got %q", got)
+	}
+}
+
+func TestRegionalizeURLForProfileUsesPayloadProfileArnRegion(t *testing.T) {
+	account := &config.Account{Region: "ap-southeast-1"}
+
+	got := regionalizeURLForProfile(
+		"https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse",
+		account,
+		"arn:aws:codewhisperer:eu-central-1:123456789012:profile/test",
+	)
+	want := "https://q.eu-central-1.amazonaws.com/generateAssistantResponse"
+	if got != want {
+		t.Fatalf("expected payload profile ARN region URL %q, got %q", want, got)
+	}
+}
+
 func TestResolveProfileArnFetchesAndCachesProfile(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	if err := config.Init(configPath); err != nil {

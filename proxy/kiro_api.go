@@ -21,13 +21,29 @@ const (
 
 var profileArnResolutionCooldowns sync.Map
 
-// kiroRegion returns the AWS region the account's Kiro profile lives in,
-// defaulting to us-east-1 when unset. AWS provisions Kiro / Q Developer
-// profiles per region, so a profile such as KiroProfile-eu-central-1 only
-// resolves against its own regional endpoint. Every data-plane call must
-// therefore target the account's region rather than a hardcoded one.
+func regionFromProfileArn(profileArn string) string {
+	parts := strings.SplitN(strings.TrimSpace(profileArn), ":", 6)
+	if len(parts) < 6 || parts[0] != "arn" || parts[2] != "codewhisperer" {
+		return ""
+	}
+	return strings.TrimSpace(parts[3])
+}
+
+// kiroRegion returns the AWS data-plane region for Kiro / Q calls.
+// Prefer profileArn because account.Region is the auth/OIDC region and can
+// differ from the profile's region.
 func kiroRegion(account *config.Account) string {
+	return kiroRegionForProfile(account, "")
+}
+
+func kiroRegionForProfile(account *config.Account, profileArn string) string {
+	if r := regionFromProfileArn(profileArn); r != "" {
+		return r
+	}
 	if account != nil {
+		if r := regionFromProfileArn(account.ProfileArn); r != "" {
+			return r
+		}
 		if r := strings.TrimSpace(account.Region); r != "" {
 			return r
 		}
@@ -35,13 +51,17 @@ func kiroRegion(account *config.Account) string {
 	return "us-east-1"
 }
 
-// regionalizeURL points a hardcoded us-east-1 Kiro endpoint at the account's
-// region. Amazon Q is regional (q.{region}.amazonaws.com), but the CodeWhisperer
+// regionalizeURL points a hardcoded us-east-1 Kiro endpoint at the profile's
+// data-plane region. Amazon Q is regional (q.{region}.amazonaws.com), but the CodeWhisperer
 // REST host only exists in us-east-1 — non-us-east-1 accounts are served by the
-// regional Amazon Q host instead. So for those accounts both us-east-1 hosts map
-// to q.{region}. It is a no-op for us-east-1 accounts.
+// regional Amazon Q host instead. Both us-east-1 hosts map
+// to q.{region}. It is a no-op for us-east-1 profiles.
 func regionalizeURL(rawURL string, account *config.Account) string {
-	region := kiroRegion(account)
+	return regionalizeURLForProfile(rawURL, account, "")
+}
+
+func regionalizeURLForProfile(rawURL string, account *config.Account, profileArn string) string {
+	region := kiroRegionForProfile(account, profileArn)
 	if region == "us-east-1" {
 		return rawURL
 	}
