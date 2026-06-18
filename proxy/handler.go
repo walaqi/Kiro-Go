@@ -1216,7 +1216,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			h.recordFailure()
 			h.sendSSE(w, flusher, "error", map[string]interface{}{
 				"type":  "error",
-				"error": map[string]string{"type": "api_error", "message": err.Error()},
+				"error": map[string]string{"type": "api_error", "message": downstreamErrorMessage(err)},
 			})
 			return
 		}
@@ -1285,22 +1285,10 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		return
 	}
 
-	if lastErr == nil {
-		h.sendClaudeError(w, 503, "api_error", "No available accounts")
-		return
-	}
-
-	if isMalformedRequestErrorMessage(lastErr.Error()) {
-		// Client-side request-structure error: return 400 so the client stops
-		// retrying (a 500 would trigger client-side retries that re-amplify the
-		// failure across the account pool and burn upstream credits). Not counted
-		// as a proxy failure.
-		h.sendClaudeError(w, 400, "invalid_request_error", lastErr.Error())
-		return
-	}
-
-	h.recordFailure()
-	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
+	// Sanitize the internal error (e.g. "quota exhausted on AmazonQ",
+	// "all endpoints failed", "No available accounts") before it reaches the
+	// client; classifyDownstreamError picks the status and client-safe message.
+	h.sendClaudeFailover(w, lastErr)
 }
 
 func (h *Handler) sendSSE(w http.ResponseWriter, flusher http.Flusher, event string, data interface{}) {
@@ -1507,20 +1495,9 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		return
 	}
 
-	if lastErr == nil {
-		h.sendClaudeError(w, 503, "api_error", "No available accounts")
-		return
-	}
-
-	if isMalformedRequestErrorMessage(lastErr.Error()) {
-		// Client-side request-structure error: return 400 so the client stops
-		// retrying instead of re-amplifying across the account pool. Not a proxy failure.
-		h.sendClaudeError(w, 400, "invalid_request_error", lastErr.Error())
-		return
-	}
-
-	h.recordFailure()
-	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
+	// Sanitize the internal error (incl. nil = no available account) before it
+	// reaches the client; classifyDownstreamError picks status + safe message.
+	h.sendClaudeFailover(w, lastErr)
 }
 
 // logZeroInputTokens asynchronously dumps a full diagnostic record whenever a
@@ -1556,6 +1533,21 @@ func (h *Handler) sendClaudeError(w http.ResponseWriter, status int, errType, me
 			"message": message,
 		},
 	})
+}
+
+// sendClaudeFailover emits the terminal error for a Claude request after all
+// account attempts failed, sanitizing the internal error so no upstream/pool
+// detail leaks downstream. lastErr may be nil (no available account).
+func (h *Handler) sendClaudeFailover(w http.ResponseWriter, lastErr error) {
+	status, message, countAsFailure := classifyDownstreamError(lastErr)
+	errType := "api_error"
+	if status == 400 {
+		errType = "invalid_request_error"
+	}
+	if countAsFailure {
+		h.recordFailure()
+	}
+	h.sendClaudeError(w, status, errType, message)
 }
 
 // handleOpenAIChat OpenAI API 处理
@@ -1984,20 +1976,9 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		return
 	}
 
-	if lastErr == nil {
-		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
-		return
-	}
-
-	if isMalformedRequestErrorMessage(lastErr.Error()) {
-		// Client-side request-structure error: return 400 so the client stops
-		// retrying instead of re-amplifying across the account pool. Not a proxy failure.
-		h.sendOpenAIError(w, 400, "invalid_request_error", lastErr.Error())
-		return
-	}
-
-	h.recordFailure()
-	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
+	// Sanitize the internal error (incl. nil = no available account) before it
+	// reaches the client; classifyDownstreamError picks status + safe message.
+	h.sendOpenAIFailover(w, lastErr)
 }
 
 // handleOpenAINonStream OpenAI 非流式响应
@@ -2078,20 +2059,9 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		return
 	}
 
-	if lastErr == nil {
-		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
-		return
-	}
-
-	if isMalformedRequestErrorMessage(lastErr.Error()) {
-		// Client-side request-structure error: return 400 so the client stops
-		// retrying instead of re-amplifying across the account pool. Not a proxy failure.
-		h.sendOpenAIError(w, 400, "invalid_request_error", lastErr.Error())
-		return
-	}
-
-	h.recordFailure()
-	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
+	// Sanitize the internal error (incl. nil = no available account) before it
+	// reaches the client; classifyDownstreamError picks status + safe message.
+	h.sendOpenAIFailover(w, lastErr)
 }
 
 func (h *Handler) sendOpenAIError(w http.ResponseWriter, status int, errType, message string) {
@@ -2103,6 +2073,21 @@ func (h *Handler) sendOpenAIError(w http.ResponseWriter, status int, errType, me
 			"message": message,
 		},
 	})
+}
+
+// sendOpenAIFailover emits the terminal error for an OpenAI/Responses request
+// after all account attempts failed, sanitizing the internal error so no
+// upstream/pool detail leaks downstream. lastErr may be nil (no available account).
+func (h *Handler) sendOpenAIFailover(w http.ResponseWriter, lastErr error) {
+	status, message, countAsFailure := classifyDownstreamError(lastErr)
+	errType := "server_error"
+	if status == 400 {
+		errType = "invalid_request_error"
+	}
+	if countAsFailure {
+		h.recordFailure()
+	}
+	h.sendOpenAIError(w, status, errType, message)
 }
 
 // ensureValidToken 确保 token 有效

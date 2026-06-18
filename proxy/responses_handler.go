@@ -204,12 +204,9 @@ func (h *Handler) handleResponsesNonStream(
 		return
 	}
 
-	if lastErr == nil {
-		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
-		return
-	}
-	h.recordFailure()
-	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
+	// Sanitize the internal error (incl. nil = no available account) before it
+	// reaches the client; classifyDownstreamError picks status + safe message.
+	h.sendOpenAIFailover(w, lastErr)
 }
 
 func buildResponsesObject(
@@ -482,7 +479,7 @@ func (h *Handler) handleResponsesStream(
 					"status": "failed",
 					"error": map[string]string{
 						"type":    "server_error",
-						"message": err.Error(),
+						"message": downstreamErrorMessage(err),
 					},
 				},
 			})
@@ -554,21 +551,13 @@ func (h *Handler) handleResponsesStream(
 		return
 	}
 
-	if lastErr == nil {
-		send("response.failed", map[string]interface{}{
-			"type": "response.failed",
-			"response": map[string]interface{}{
-				"id":     respID,
-				"status": "failed",
-				"error": map[string]string{
-					"type":    "server_error",
-					"message": "No available accounts",
-				},
-			},
-		})
-		return
+	// Sanitize the internal error before it reaches the client; nil = no
+	// available account. classifyDownstreamError yields the safe message and
+	// whether this counts as a proxy failure.
+	_, safeMsg, countAsFailure := classifyDownstreamError(lastErr)
+	if countAsFailure {
+		h.recordFailure()
 	}
-	h.recordFailure()
 	send("response.failed", map[string]interface{}{
 		"type": "response.failed",
 		"response": map[string]interface{}{
@@ -576,7 +565,7 @@ func (h *Handler) handleResponsesStream(
 			"status": "failed",
 			"error": map[string]string{
 				"type":    "server_error",
-				"message": lastErr.Error(),
+				"message": safeMsg,
 			},
 		},
 	})
