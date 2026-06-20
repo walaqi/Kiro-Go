@@ -8,12 +8,13 @@ Kiro-Go is a reverse proxy service that translates Kiro API requests into OpenAI
 
 **Core Features:**
 - Anthropic `/v1/messages` & OpenAI `/v1/chat/completions` endpoints
-- Multi-account pool with weighted round-robin load balancing
+- Multi-account pool with priority-based selection (highest weight first)
 - Auto token refresh and SSE streaming support
 - Multiple auth methods: AWS Builder ID, IAM Identity Center (Enterprise SSO), SSO Token, local cache, credentials JSON
 - Usage tracking and pricing calibration
-- Web admin panel (built-in, no separate frontend repo)
+- Web admin panel (built-in, no separate frontend repo) with request logs viewer
 - Support for outbound proxies (SOCKS5 / HTTP)
+- Regional data-plane routing (profile ARN region auto-detection)
 
 ## Quick Build & Test Commands
 
@@ -81,9 +82,11 @@ Request Routing: /v1/messages (Claude) or /v1/chat/completions (OpenAI)
     ↓
 proxy/translator.go (Convert request format)
     ↓
-pool/account.go (Select next available account via weighted round-robin)
+pool/account.go (Select highest-priority available account)
     ↓
 auth/*.go (Refresh token if needed)
+    ↓
+proxy/kiro_api.go (Regionalize endpoint URL based on profile ARN)
     ↓
 proxy/kiro.go (Call upstream Kiro API with streaming)
     ↓
@@ -99,6 +102,7 @@ HTTP Response (stream or complete)
 **`config/`** - Persistent configuration management
 - `config.go`: Account storage, settings (port, host, API keys, passwords), usage metrics, thinking mode config
 - `apikeys.go`: API key management (for proxy authentication)
+- `state.go`: Runtime state (request counters, per-account stats) split from config; persisted to `data/config.state.json` with atomic writes
 - Thread-safe read-write mutex protection around JSON-persisted state
 - Single source of truth: `data/config.json` (or `CONFIG_PATH`)
 
@@ -111,23 +115,26 @@ HTTP Response (stream or complete)
 - All methods return: `(accessToken, refreshToken, expiresAt, profileArn, error)`
 
 **`pool/`** - Account pool & load balancing
-- `account.go`: Weighted round-robin selection, cooldown on errors, per-account fail tracking
+- `account.go`: Priority-based selection (accounts sorted by weight descending, first available wins), cooldown on errors, per-account fail tracking
 - Accounts marked over-quota are skipped unless `AllowOverUsage` is enabled or per-account `OverageStatus=ENABLED`
 - Token refresh skew: 120 seconds before expiration to proactively refresh
-- Filters disabled accounts and quota-blocked accounts before building weighted list
+- Filters disabled accounts and quota-blocked accounts; falls back to shortest-cooldown account when all are cooling down
 
 **`proxy/`** - Core request/response translation & streaming
-- `handler.go` (3600+ lines): Main HTTP handler, routes to `/v1/messages`, `/v1/chat/completions`, and `/v1/responses`; manages background refresh task
-- `translator.go` (2150 lines): Bidirectional translation between Kiro API ↔ Claude/OpenAI formats, token estimation, thinking mode handling
-- `kiro.go` (842 lines): Kiro API endpoint selection, EventStream parsing, streaming response handling
-- `kiro_api.go`: Kiro API request construction (generateAssistantResponse)
+- `handler.go` (~3800 lines): Main HTTP handler, routes to `/v1/messages`, `/v1/chat/completions`, and `/v1/responses`; manages background refresh task; request logs (in-memory ring buffer, 500 entries)
+- `translator.go` (~2450 lines): Bidirectional translation between Kiro API ↔ Claude/OpenAI formats, token estimation, thinking mode handling
+- `kiro.go` (~960 lines): Kiro API endpoint selection, EventStream parsing, streaming response handling
+- `kiro_api.go`: REST API helpers (GetUsageLimits, GetUserInfo, ListAvailableModels, ResolveProfileArn); regional URL routing (`regionalizeURL` / `regionalizeURLForProfile`); BuilderId profile lookup suppression (24h cooldown)
 - `cache_tracker.go`: Tracks prompt cache usage (Claude's @-tagging feature)
 - `responses_handler.go` / `responses_types.go` / `responses_input.go` / `responses_history.go` / `responses_store.go`: OpenAI Responses API (`/v1/responses`) implementation — stateful multi-turn via `previous_response_id`, stored responses persisted to `data/responses/` with 30-day TTL auto-purge
-- `account_failover.go`: Per-request account retry logic (up to 3 attempts); classifies upstream errors as quota, overage, suspension, or profile-unavailable to decide cooldown vs. skip
+- `account_failover.go`: Per-request account retry logic (up to 3 attempts); classifies upstream errors as quota, overage, suspension, or profile-unavailable to decide cooldown vs. skip; sanitizes internal errors before reaching clients
 - `auth.go`: API key authentication middleware; injects the matched `ApiKeyEntry` into request context
 - `kiro_headers.go`: Builds Kiro-specific HTTP headers (`x-amzn-codewhisperer-*`, User-Agent) from account state
 - `kiro_overage.go`: Calls the AWS Q API to read and toggle per-account Overages switch (`setUserPreference`)
+- `stop_sequence_filter.go`: Adapter-side stop_sequences enforcement (upstream doesn't support stop param); scans visible text only (thinking exempt)
+- `tool_leak_filter.go`: Rescues tool-call XML leaked into assistant text; cross-frame filtering with config.json toggle
 - `token_estimator.go`: Rough token estimation for request bodies (used when exact counts are unavailable)
+- `tokenizer.go`: tiktoken BPE tokenizer integration for accurate output token counting
 - `pricing.go` / `pricing_updater.go`: Model pricing calibration and auto-update from upstream; runtime cache at `data/model_pricing.json`, fallback bundled at `proxy/model_pricing.json`
 
 **`logger/`** - Structured logging
@@ -136,6 +143,9 @@ HTTP Response (stream or complete)
 **`web/`** - Admin panel frontend (browser-based)
 - Static HTML/CSS/JS files served from HTTP handler
 - No separate frontend build step; files are embedded or served directly
+- `styles.css`: Standalone stylesheet (3600+ lines)
+- Tabs: Accounts, Settings, API, Filter (prompt injection/regex), Logs (request history)
+- Localization: `web/locales/en.json` and `web/locales/zh.json`
 
 ### Config Structure
 
@@ -161,7 +171,8 @@ The `config.json` file stored in `CONFIG_PATH` (default: `data/config.json`) con
       "clientId": "...",
       "clientSecret": "...",
       "region": "us-east-1",
-      "profileArn": "arn:...",
+      "profileArn": "arn:aws:codewhisperer:{region}:{accountId}:profile/{name}",
+      "provider": "BuilderId" | "IAMIdentityCenter",
       "weight": 1,
       "enabled": true,
       "usageCurrent": 0.0,
@@ -220,7 +231,7 @@ The `config.json` file stored in `CONFIG_PATH` (default: `data/config.json`) con
 
 ## Test Infrastructure
 
-23 test files across the codebase using Go's standard `testing` package. Tests often:
+29 test files across the codebase using Go's standard `testing` package. Tests often:
 - Create temp config files (`t.TempDir()`) for isolated testing
 - Mock HTTP endpoints using `httptest.Server`
 - Use `config.Init()` to bootstrap test configs
@@ -231,9 +242,17 @@ Key test areas:
 - `handler_test.go`: HTTP request/response, streaming, model listing
 - `translator_test.go`: Request/response translation, token counting, thinking mode
 - `pricing_test.go`: Model pricing calibration
-- `account_test.go`: Token refresh, cooldown, weight calculation
+- `account_test.go`: Token refresh, cooldown, priority selection
+- `kiro_api_test.go`: Profile ARN resolution, regional URL routing, BuilderId suppression
 
 ## Important Implementation Details
+
+**Region Routing (Data-Plane):**
+- Profile ARN contains the authoritative region: `arn:aws:codewhisperer:{region}:...`
+- Region priority: payload profileArn → account.ProfileArn → account.Region → us-east-1
+- `regionalizeURLForProfile()` rewrites hardcoded us-east-1 hosts to regional Amazon Q endpoints (`q.{region}.amazonaws.com`)
+- CodeWhisperer REST endpoint only exists in us-east-1; non-us-east-1 profiles route to Q regional host
+- BuilderId accounts: `ListAvailableProfiles` returns 403; suppressed for 24h after first failure; REST calls continue without profileArn
 
 **Quota & Overages:**
 - Accounts track `usageCurrent` and `usageLimit`
@@ -289,7 +308,7 @@ Current version: `1.1.2` (defined in `version.json`)
 ## Useful Context
 
 - **Go version:** 1.21+
-- **Dependencies:** Minimal; only `github.com/google/uuid` for UUID generation
+- **Dependencies:** `github.com/google/uuid`, `github.com/pkoukk/tiktoken-go` + loader, `github.com/dlclark/regexp2`
 - **Entry point:** `main.go` (short, handles initialization and starts HTTP server)
 - **Default port:** 8080
 - **Default config path:** `data/config.json` (overridable via `CONFIG_PATH` env var)
