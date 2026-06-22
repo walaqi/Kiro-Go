@@ -26,3 +26,4 @@ PR-*.md
 deploy/
 temp/
 instances/
+instances/**/*
