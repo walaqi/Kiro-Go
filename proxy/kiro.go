@@ -397,7 +397,7 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		if resp.StatusCode != 200 {
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			lastErr = fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
+			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(errBody))
 			// 4xx client errors are caused by the request itself (malformed body,
 			// auth, payment), not by the endpoint. Retrying the SAME payload on a
 			// different endpoint cannot succeed and only burns upstream credits, so

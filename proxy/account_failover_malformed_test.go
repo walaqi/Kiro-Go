@@ -9,8 +9,7 @@ import "testing"
 // or account-specific errors are NOT misclassified.
 func TestIsMalformedRequestErrorMessage(t *testing.T) {
 	malformed := []string{
-		`HTTP 400 from AmazonQ: {"message":"Improperly formed request.","reason":null}`,
-		`HTTP 400 from CodeWhisperer: {"message":"Improperly formed request.","reason":null}`,
+		`HTTP 400: {"message":"Improperly formed request.","reason":null}`,
 		"Improperly formed request.",
 		"http 400 something",
 	}
@@ -21,8 +20,8 @@ func TestIsMalformedRequestErrorMessage(t *testing.T) {
 	}
 
 	notMalformed := []string{
-		`HTTP 500 from AmazonQ: {"message":"Encountered an unexpected error..."}`,
-		`HTTP 500 from AmazonQ: {"message":"...MODEL_TEMPORARILY_UNAVAILABLE"}`,
+		`HTTP 500: {"message":"Encountered an unexpected error..."}`,
+		`HTTP 500: {"message":"...MODEL_TEMPORARILY_UNAVAILABLE"}`,
 		"HTTP 429 quota exceeded",
 		"HTTP 403 forbidden",
 		"HTTP 401 unauthorized",
