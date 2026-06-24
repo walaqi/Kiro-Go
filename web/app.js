@@ -661,6 +661,7 @@
   // Data loaders
   async function loadData() {
     await Promise.all([loadStats(), loadAccounts(), loadSettings(), loadVersion()]);
+    initDailyStats();
     renderEndpointCode('claudeEndpoint', baseUrl + '/v1/messages');
     renderEndpointCode('openaiEndpoint', baseUrl + '/v1/chat/completions');
     renderEndpointCode('openaiResponsesEndpoint', baseUrl + '/v1/responses');
@@ -677,6 +678,52 @@
     $('statFailed').textContent = d.failedRequests || 0;
     $('statTokens').textContent = formatNum(d.totalTokens || 0);
     $('statCredits').textContent = (d.totalCredits || 0).toFixed(1);
+  }
+
+  // ===== Daily Stats =====
+  function todayStr() {
+    const now = new Date();
+    const y = now.getFullYear();
+    const m = String(now.getMonth() + 1).padStart(2, '0');
+    const d = String(now.getDate()).padStart(2, '0');
+    return y + '-' + m + '-' + d;
+  }
+
+  async function loadDailyStats(date) {
+    if (!date) date = todayStr();
+    try {
+      const res = await api('/stats/daily?date=' + encodeURIComponent(date));
+      const d = await res.json();
+      $('dailyCredits').textContent = (d.totalCredits || 0).toFixed(2);
+      $('dailyRequests').textContent = d.totalRequests || 0;
+      $('dailyTokens').textContent = formatNum(d.totalTokens || 0);
+    } catch (e) {
+      $('dailyCredits').textContent = '0';
+      $('dailyRequests').textContent = '0';
+      $('dailyTokens').textContent = '0';
+    }
+  }
+
+  function initDailyStats() {
+    const input = $('dailyDateInput');
+    const btn = $('dailyDateBtn');
+    if (!input || !btn) return;
+    input.value = todayStr();
+    btn.addEventListener('click', function() {
+      const v = input.value.trim();
+      if (/^\d{4}-\d{2}-\d{2}$/.test(v)) {
+        loadDailyStats(v);
+      }
+    });
+    input.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter') {
+        const v = input.value.trim();
+        if (/^\d{4}-\d{2}-\d{2}$/.test(v)) {
+          loadDailyStats(v);
+        }
+      }
+    });
+    loadDailyStats();
   }
 
   // ===== Logs =====
