@@ -57,6 +57,34 @@ func isMalformedRequestErrorMessage(msg string) bool {
 		strings.Contains(msg, "improperly formed request")
 }
 
+// sanitizeUpstreamError strips internal platform identifiers from an upstream
+// error message body so they never reach downstream clients. The upstream may
+// embed prefixes like "Bedrock error message: " inside the JSON payload which
+// would reveal infrastructure details.
+func sanitizeUpstreamError(msg string) string {
+	// Case-insensitive strip of "Bedrock error message: " prefix that AWS
+	// injects into the "message" field of 400 response bodies.
+	lower := strings.ToLower(msg)
+	for {
+		idx := strings.Index(lower, "bedrock error message: ")
+		if idx == -1 {
+			break
+		}
+		prefix := msg[:idx]
+		suffix := msg[idx+len("bedrock error message: "):]
+		msg = prefix + suffix
+		lower = strings.ToLower(msg)
+	}
+	// Also strip bare "Bedrock" if it appears as a standalone word (e.g.
+	// "Bedrock throttling" edge cases). Only strip when surrounded by word
+	// boundaries (space/punctuation/start/end) to avoid false positives.
+	msg = strings.ReplaceAll(msg, "Bedrock ", "")
+	msg = strings.ReplaceAll(msg, "bedrock ", "")
+	msg = strings.ReplaceAll(msg, " Bedrock", "")
+	msg = strings.ReplaceAll(msg, " bedrock", "")
+	return msg
+}
+
 // Downstream-facing error messages. Internal diagnostic strings (e.g.
 // "quota exhausted on AmazonQ", "all endpoints failed", "No available
 // accounts") must never reach the client — they leak upstream endpoint names
@@ -87,7 +115,7 @@ func classifyDownstreamError(err error) (status int, message string, countAsFail
 	}
 	msg := err.Error()
 	if isMalformedRequestErrorMessage(msg) {
-		return 400, msg, false
+		return 400, sanitizeUpstreamError(msg), false
 	}
 	if isQuotaErrorMessage(msg) {
 		return 429, msgServiceCoolingDown, true
