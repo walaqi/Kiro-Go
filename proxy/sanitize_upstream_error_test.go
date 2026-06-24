@@ -62,6 +62,81 @@ func TestClassifyDownstreamErrorSanitizesBedrock(t *testing.T) {
 	}
 }
 
+// TestClassifyDownstreamErrorAllBranches covers nil, quota/429, and generic
+// error paths in addition to the 400 path tested above.
+func TestClassifyDownstreamErrorAllBranches(t *testing.T) {
+	tests := []struct {
+		name           string
+		err            error
+		wantStatus     int
+		wantMsg        string
+		wantCountFail  bool
+	}{
+		{
+			name:          "nil error returns 503",
+			err:           nil,
+			wantStatus:    503,
+			wantMsg:       msgServiceUnavailable,
+			wantCountFail: false,
+		},
+		{
+			name:          "quota 429 error",
+			err:           errors.New("HTTP 429: quota exceeded"),
+			wantStatus:    429,
+			wantMsg:       msgServiceCoolingDown,
+			wantCountFail: true,
+		},
+		{
+			name:          "generic 500 error",
+			err:           errors.New("HTTP 500: internal server error"),
+			wantStatus:    503,
+			wantMsg:       msgServiceUnavailable,
+			wantCountFail: true,
+		},
+		{
+			name:          "all endpoints failed",
+			err:           errors.New("all endpoints failed"),
+			wantStatus:    503,
+			wantMsg:       msgServiceUnavailable,
+			wantCountFail: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			status, msg, countFail := classifyDownstreamError(tc.err)
+			if status != tc.wantStatus {
+				t.Errorf("status: got %d, want %d", status, tc.wantStatus)
+			}
+			if msg != tc.wantMsg {
+				t.Errorf("msg: got %q, want %q", msg, tc.wantMsg)
+			}
+			if countFail != tc.wantCountFail {
+				t.Errorf("countAsFailure: got %v, want %v", countFail, tc.wantCountFail)
+			}
+		})
+	}
+}
+
+// TestDownstreamErrorMessage covers the downstreamErrorMessage helper.
+func TestDownstreamErrorMessage(t *testing.T) {
+	tests := []struct {
+		err  error
+		want string
+	}{
+		{nil, msgServiceUnavailable},
+		{errors.New("HTTP 429: quota"), msgServiceCoolingDown},
+		{errors.New(`HTTP 400: {"message":"Bedrock error message: bad input"}`), `HTTP 400: {"message":"bad input"}`},
+		{errors.New("random failure"), msgServiceUnavailable},
+	}
+	for _, tc := range tests {
+		got := downstreamErrorMessage(tc.err)
+		if got != tc.want {
+			t.Errorf("downstreamErrorMessage(%v) = %q, want %q", tc.err, got, tc.want)
+		}
+	}
+}
+
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||
 		(len(s) > 0 && stringContains(s, substr)))
