@@ -289,6 +289,11 @@ type Config struct {
 	// configured from the admin "过滤" tab.
 	Filter *FilterConfig `json:"filter,omitempty"`
 
+	// Timezone is used for date-based aggregation (daily stats files, etc.).
+	// Accepts any IANA timezone name (e.g. "Asia/Shanghai", "America/New_York").
+	// Defaults to "Asia/Shanghai" when empty.
+	Timezone string `json:"timezone,omitempty"`
+
 	// LogLevel controls verbosity of application logs.
 	// Accepted values: "debug", "info", "warn", "error". Defaults to "info".
 	// Can be overridden by the LOG_LEVEL environment variable.
@@ -1123,6 +1128,36 @@ func UpdateLogLevel(level string) error {
 	defer cfgLock.Unlock()
 	cfg.LogLevel = level
 	return Save()
+}
+
+// GetTimezone returns the configured *time.Location for date-based aggregation.
+// Defaults to Asia/Shanghai if unset or invalid.
+func GetTimezone() *time.Location {
+	cfgLock.RLock()
+	tz := ""
+	if cfg != nil {
+		tz = cfg.Timezone
+	}
+	cfgLock.RUnlock()
+	if tz == "" {
+		tz = "Asia/Shanghai"
+	}
+	loc, err := time.LoadLocation(tz)
+	if err != nil {
+		return time.FixedZone("CST", 8*3600)
+	}
+	return loc
+}
+
+// GetDataDir returns the directory containing the active config file.
+// All auxiliary data files (state, daily stats, etc.) are co-located here.
+func GetDataDir() string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfgPath == "" {
+		return "data"
+	}
+	return filepath.Dir(cfgPath)
 }
 
 type KiroClientConfig struct {
