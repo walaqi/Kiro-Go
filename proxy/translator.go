@@ -215,6 +215,8 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	var currentContent string
 	var currentImages []KiroImage
 	var currentToolResults []KiroToolResult
+	var lastAssistantThinking string
+	lastAssistantHistoryIdx := -1
 
 	for i, msg := range req.Messages {
 		isLast := i == len(req.Messages)-1
@@ -246,13 +248,28 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 				})
 			}
 		} else if msg.Role == "assistant" {
-			content, toolUses := extractClaudeAssistantContent(msg.Content)
+			content, toolUses, thinkingContent := extractClaudeAssistantContent(msg.Content)
 			history = append(history, KiroHistoryMessage{
 				AssistantResponseMessage: &KiroAssistantResponseMessage{
 					Content:  content,
 					ToolUses: toolUses,
 				},
 			})
+			// Track the last assistant's thinking for later injection.
+			lastAssistantThinking = thinkingContent
+			lastAssistantHistoryIdx = len(history) - 1
+		}
+	}
+
+	// Inject the last assistant's thinking into its history content so the
+	// model retains awareness of its most recent reasoning chain.
+	if lastAssistantThinking != "" && lastAssistantHistoryIdx >= 0 && lastAssistantHistoryIdx < len(history) {
+		if len(lastAssistantThinking) > maxPriorReasoningLen {
+			lastAssistantThinking = lastAssistantThinking[:maxPriorReasoningLen] + "..."
+		}
+		entry := history[lastAssistantHistoryIdx].AssistantResponseMessage
+		if entry != nil {
+			entry.Content = "<prior_reasoning>\n" + lastAssistantThinking + "\n</prior_reasoning>\n" + entry.Content
 		}
 	}
 
@@ -714,12 +731,17 @@ func extractToolResultContent(content interface{}) (string, []KiroImage) {
 	return "", nil
 }
 
-func extractClaudeAssistantContent(content interface{}) (string, []KiroToolUse) {
+// maxPriorReasoningLen caps the character length of prior thinking content
+// injected into history to avoid excessive token consumption.
+const maxPriorReasoningLen = 8000
+
+func extractClaudeAssistantContent(content interface{}) (string, []KiroToolUse, string) {
 	var text string
 	var toolUses []KiroToolUse
+	var thinking string
 
 	if s, ok := content.(string); ok {
-		return s, nil
+		return s, nil, ""
 	}
 
 	if blocks, ok := content.([]interface{}); ok {
@@ -734,6 +756,10 @@ func extractClaudeAssistantContent(content interface{}) (string, []KiroToolUse) 
 			case "text":
 				if t, ok := block["text"].(string); ok {
 					text += t
+				}
+			case "thinking":
+				if t, ok := block["thinking"].(string); ok {
+					thinking += t
 				}
 			case "tool_use":
 				id, _ := block["id"].(string)
@@ -751,7 +777,7 @@ func extractClaudeAssistantContent(content interface{}) (string, []KiroToolUse) 
 		}
 	}
 
-	return text, toolUses
+	return text, toolUses, thinking
 }
 
 func convertClaudeTools(tools []ClaudeTool, descRules []config.ToolDescReplaceRule) ([]KiroToolWrapper, map[string]string) {

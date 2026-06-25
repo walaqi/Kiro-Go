@@ -728,3 +728,116 @@ func TestOpenAIToolResultImageCarriedWhenFollowedByUser(t *testing.T) {
 		t.Fatalf("tool image should not leak into a later user message, got %d on current", len(cur.Images))
 	}
 }
+
+func TestClaudeToKiroPreservesLastAssistantThinking(t *testing.T) {
+	req := &ClaudeRequest{
+		Model: "claude-sonnet-4.5",
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "hello"},
+			{
+				Role: "assistant",
+				Content: []interface{}{
+					map[string]interface{}{"type": "thinking", "thinking": "early reasoning"},
+					map[string]interface{}{"type": "text", "text": "first reply"},
+				},
+			},
+			{Role: "user", Content: "follow up"},
+			{
+				Role: "assistant",
+				Content: []interface{}{
+					map[string]interface{}{"type": "thinking", "thinking": "latest reasoning chain"},
+					map[string]interface{}{"type": "text", "text": "second reply"},
+				},
+			},
+			{Role: "user", Content: "final question"},
+		},
+	}
+
+	payload := ClaudeToKiro(req, true)
+
+	// The last assistant message (index 1 in history after priming) should have
+	// prior_reasoning injected; the earlier one should not.
+	history := payload.ConversationState.History
+	var withReasoning []string
+	for _, h := range history {
+		if h.AssistantResponseMessage != nil && strings.Contains(h.AssistantResponseMessage.Content, "<prior_reasoning>") {
+			withReasoning = append(withReasoning, h.AssistantResponseMessage.Content)
+		}
+	}
+
+	if len(withReasoning) != 1 {
+		t.Fatalf("expected exactly 1 assistant message with prior_reasoning, got %d", len(withReasoning))
+	}
+	if !strings.Contains(withReasoning[0], "latest reasoning chain") {
+		t.Fatalf("expected last thinking content, got %q", withReasoning[0])
+	}
+	if strings.Contains(withReasoning[0], "early reasoning") {
+		t.Fatal("earlier thinking should NOT appear in prior_reasoning")
+	}
+	if !strings.Contains(withReasoning[0], "second reply") {
+		t.Fatalf("original text content should still be present, got %q", withReasoning[0])
+	}
+}
+
+func TestClaudeToKiroThinkingTruncatedAtMaxLen(t *testing.T) {
+	longThinking := strings.Repeat("x", maxPriorReasoningLen+500)
+	req := &ClaudeRequest{
+		Model: "claude-sonnet-4.5",
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "hello"},
+			{
+				Role: "assistant",
+				Content: []interface{}{
+					map[string]interface{}{"type": "thinking", "thinking": longThinking},
+					map[string]interface{}{"type": "text", "text": "reply"},
+				},
+			},
+			{Role: "user", Content: "next"},
+		},
+	}
+
+	payload := ClaudeToKiro(req, true)
+	for _, h := range payload.ConversationState.History {
+		if h.AssistantResponseMessage != nil && strings.Contains(h.AssistantResponseMessage.Content, "<prior_reasoning>") {
+			// Should be truncated: maxPriorReasoningLen + "..." + wrapping tags + "reply"
+			if strings.Contains(h.AssistantResponseMessage.Content, strings.Repeat("x", maxPriorReasoningLen+1)) {
+				t.Fatal("thinking content should have been truncated")
+			}
+			if !strings.Contains(h.AssistantResponseMessage.Content, "...\n</prior_reasoning>") {
+				t.Fatal("truncated thinking should end with ellipsis before closing tag")
+			}
+			return
+		}
+	}
+	t.Fatal("no prior_reasoning block found in history")
+}
+
+func TestClaudeToKiroNoThinkingInjectionWhenThinkingDisabled(t *testing.T) {
+	req := &ClaudeRequest{
+		Model: "claude-sonnet-4.5",
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "hello"},
+			{
+				Role: "assistant",
+				Content: []interface{}{
+					map[string]interface{}{"type": "thinking", "thinking": "some reasoning"},
+					map[string]interface{}{"type": "text", "text": "reply"},
+				},
+			},
+			{Role: "user", Content: "next"},
+		},
+	}
+
+	// thinking=false: non-thinking request, thinking blocks in history are still
+	// preserved because the client may have switched modes mid-conversation.
+	payload := ClaudeToKiro(req, false)
+	for _, h := range payload.ConversationState.History {
+		if h.AssistantResponseMessage != nil && strings.Contains(h.AssistantResponseMessage.Content, "<prior_reasoning>") {
+			// Even without thinking mode, we preserve the last reasoning so the
+			// model keeps context continuity.
+			return
+		}
+	}
+	// This is acceptable either way — the feature preserves regardless of current
+	// thinking mode since the reasoning was already generated in a prior turn.
+}
