@@ -1694,11 +1694,14 @@
     const res = await api('/settings');
     const d = await res.json();
     $('creditsToUSDInput').value = d.creditsToUSD || 0.2;
+    $('cacheReadBiasInput').value = d.cacheReadBias || 0;
   }
   async function saveCostConfig() {
     const val = parseFloat($('creditsToUSDInput').value);
     if (isNaN(val) || val <= 0) { toast(t('settings.creditsToUSDRequired'), 'warning'); return; }
-    const res = await api('/settings', { method: 'POST', body: JSON.stringify({ creditsToUSD: val }) });
+    const bias = parseFloat($('cacheReadBiasInput').value);
+    if (isNaN(bias) || bias < 0 || bias >= 1) { toast(t('settings.cacheReadBiasRequired'), 'warning'); return; }
+    const res = await api('/settings', { method: 'POST', body: JSON.stringify({ creditsToUSD: val, cacheReadBias: bias }) });
     const d = await res.json();
     if (d.success) toast(t('settings.costSaved'), 'success');
     else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
