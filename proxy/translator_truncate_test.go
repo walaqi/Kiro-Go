@@ -126,7 +126,13 @@ func TestClaudeToKiroTruncationDoesNotOrphanToolPairs(t *testing.T) {
 	}
 	msgs = append(msgs, ClaudeMessage{Role: "user", Content: "FINAL: summarize"})
 
-	payload := ClaudeToKiro(&ClaudeRequest{Model: "claude-opus-4.8", Messages: msgs}, false)
+	payload := ClaudeToKiro(&ClaudeRequest{
+		Model:    "claude-opus-4.8",
+		Messages: msgs,
+		Tools: []ClaudeTool{
+			{Name: "fsRead", Description: "read a file", InputSchema: map[string]interface{}{"type": "object", "properties": map[string]interface{}{"path": map[string]interface{}{"type": "string"}}}},
+		},
+	}, false)
 
 	raw, err := json.Marshal(payload)
 	if err != nil {

@@ -341,6 +341,16 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 			Tools:       kiroTools,
 			ToolResults: attachToolResults,
 		}
+	} else if len(history) > 0 {
+		// No tools in current request, but history may contain structured
+		// toolUse/toolResult blocks (preserve mode). Bedrock requires toolConfig
+		// when any such blocks exist. Inject stub definitions to satisfy the
+		// constraint without flattening history.
+		if stubs := stubToolsFromHistory(history); len(stubs) > 0 {
+			payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext = &UserInputMessageContext{
+				Tools: stubs,
+			}
+		}
 	}
 
 	if len(history) > 0 {
@@ -1303,6 +1313,13 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 			Tools:       kiroTools,
 			ToolResults: attachToolResults,
 		}
+	} else if len(history) > 0 {
+		// Same stub injection as Claude path — see comment there.
+		if stubs := stubToolsFromHistory(history); len(stubs) > 0 {
+			payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext = &UserInputMessageContext{
+				Tools: stubs,
+			}
+		}
 	}
 
 	if len(history) > 0 {
@@ -1558,6 +1575,37 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 		return sanitizeKiroHistoryPreserve(history, currentToolResultIDs)
 	}
 	return sanitizeKiroHistoryFlatten(history, currentToolResultIDs)
+}
+
+// stubToolsFromHistory builds minimal tool definitions from structured toolUses
+// that survived in history. When the current request carries no tool definitions
+// but history retains structured toolUse/toolResult blocks (preserve mode),
+// upstream Bedrock requires a toolConfig to be present — otherwise it returns
+// HTTP 400 TOOL_CONFIG_MISSING. The stubs satisfy that requirement without
+// flattening history (which would inject mimicable "Tool results:" narration).
+func stubToolsFromHistory(history []KiroHistoryMessage) []KiroToolWrapper {
+	seen := make(map[string]bool)
+	var stubs []KiroToolWrapper
+	for i := range history {
+		if a := history[i].AssistantResponseMessage; a != nil {
+			for _, tu := range a.ToolUses {
+				if tu.Name != "" && !seen[tu.Name] {
+					seen[tu.Name] = true
+					stubs = append(stubs, KiroToolWrapper{})
+					s := &stubs[len(stubs)-1]
+					s.ToolSpecification.Name = tu.Name
+					s.ToolSpecification.Description = tu.Name
+					s.ToolSpecification.InputSchema = InputSchema{
+						JSON: map[string]interface{}{
+							"type":       "object",
+							"properties": map[string]interface{}{},
+						},
+					}
+				}
+			}
+		}
+	}
+	return stubs
 }
 
 // sanitizeKiroHistoryPreserve keeps structured tool calls/results in history

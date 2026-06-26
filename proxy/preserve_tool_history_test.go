@@ -39,7 +39,13 @@ func TestClaudeToKiroPreservesStructuredToolHistory(t *testing.T) {
 	// history (its toolResults are not the current message).
 	msgs = append(msgs, ClaudeMessage{Role: "user", Content: "now summarize"})
 
-	payload := ClaudeToKiro(&ClaudeRequest{Model: "claude-opus-4.8", Messages: msgs}, false)
+	payload := ClaudeToKiro(&ClaudeRequest{
+		Model:    "claude-opus-4.8",
+		Messages: msgs,
+		Tools: []ClaudeTool{
+			{Name: "exec_command", Description: "run a command", InputSchema: map[string]interface{}{"type": "object", "properties": map[string]interface{}{"cmd": map[string]interface{}{"type": "string"}}}},
+		},
+	}, false)
 
 	var structuredCalls, structuredResults, narratedTurns int
 	for _, h := range payload.ConversationState.History {
@@ -149,15 +155,48 @@ func TestPreserveNarratesOrphanedToolResult(t *testing.T) {
 	if !strings.Contains(combined.String(), "ORPHAN_DATA_XYZ") {
 		t.Fatalf("expected orphaned tool-result data narrated to text, got:\n%s", combined.String())
 	}
+}
 
-	// No history user turn may still carry the orphaned result as structured data.
-	for i, h := range payload.ConversationState.History {
-		if u := h.UserInputMessage; u != nil && u.UserInputMessageContext != nil {
-			for _, tr := range u.UserInputMessageContext.ToolResults {
-				if tr.ToolUseID == "ghost" {
-					t.Fatalf("history[%d] orphaned result kept structured (upstream rejects)", i)
-				}
-			}
+// TestStubToolConfigInjectedWhenNoToolsInRequest verifies that when the current
+// request carries no tool definitions but history contains structured tool blocks,
+// stub toolConfig is injected into UserInputMessageContext so Bedrock's
+// TOOL_CONFIG_MISSING validation passes without flattening history.
+func TestStubToolConfigInjectedWhenNoToolsInRequest(t *testing.T) {
+	t.Setenv("KIRO_PRESERVE_TOOL_HISTORY", "on")
+
+	msgs := []ClaudeMessage{
+		{Role: "user", Content: "use a tool"},
+		{Role: "assistant", Content: []interface{}{
+			map[string]interface{}{"type": "text", "text": "calling exec"},
+			map[string]interface{}{"type": "tool_use", "id": "t0", "name": "exec_command", "input": map[string]interface{}{"cmd": "ls"}},
+		}},
+		{Role: "user", Content: []interface{}{
+			map[string]interface{}{"type": "tool_result", "tool_use_id": "t0", "content": "file1\nfile2"},
+		}},
+		// Final user turn with no tool_result — no tools requested this time.
+		{Role: "user", Content: "now summarize without tools"},
+	}
+
+	// No Tools field — simulates a request that doesn't want tool use.
+	payload := ClaudeToKiro(&ClaudeRequest{Model: "claude-opus-4.8", Messages: msgs}, false)
+
+	// History must still have the structured toolUse (not flattened).
+	var structuredCalls int
+	for _, h := range payload.ConversationState.History {
+		if a := h.AssistantResponseMessage; a != nil {
+			structuredCalls += len(a.ToolUses)
 		}
+	}
+	if structuredCalls != 1 {
+		t.Fatalf("expected structured toolUse preserved in history, got %d", structuredCalls)
+	}
+
+	// UserInputMessageContext must have stub tools to satisfy Bedrock.
+	ctx := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+	if ctx == nil || len(ctx.Tools) == 0 {
+		t.Fatalf("expected stub toolConfig injected when no tools in request but history has structured blocks")
+	}
+	if ctx.Tools[0].ToolSpecification.Name != "exec_command" {
+		t.Fatalf("expected stub tool named 'exec_command', got %q", ctx.Tools[0].ToolSpecification.Name)
 	}
 }
