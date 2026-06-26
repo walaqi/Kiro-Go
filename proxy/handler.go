@@ -3118,6 +3118,7 @@ func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 		"host":           config.GetHost(),
 		"allowOverUsage": config.GetAllowOverUsage(),
 		"creditsToUSD":   config.GetCreditsToUSD(),
+		"cacheReadBias":  config.GetCacheReadBias(),
 	})
 }
 
@@ -3147,6 +3148,7 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		Password       string   `json:"password,omitempty"`
 		AllowOverUsage *bool    `json:"allowOverUsage,omitempty"`
 		CreditsToUSD   *float64 `json:"creditsToUSD,omitempty"`
+		CacheReadBias  *float64 `json:"cacheReadBias,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -3173,6 +3175,14 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 
 	if req.CreditsToUSD != nil {
 		if err := config.UpdateCreditsToUSD(*req.CreditsToUSD); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+
+	if req.CacheReadBias != nil {
+		if err := config.UpdateCacheReadBias(*req.CacheReadBias); err != nil {
 			w.WriteHeader(500)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
