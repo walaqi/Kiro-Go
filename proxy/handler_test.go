@@ -480,3 +480,55 @@ func TestBuildAnthropicModelsResponseGeneratesThinkingVariants(t *testing.T) {
 		t.Fatalf("expected image capability to be preserved, got %#v", models[0]["supports_image"])
 	}
 }
+
+func TestSettingsCacheReadBiasRoundTrip(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	t.Cleanup(func() { _ = config.UpdateCacheReadBias(0) })
+
+	h := NewHandler()
+
+	// GET /settings should return default cacheReadBias = 0
+	req := httptest.NewRequest("GET", "/api/settings", nil)
+	rec := httptest.NewRecorder()
+	h.apiGetSettings(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("GET /settings status %d", rec.Code)
+	}
+	var getResp map[string]interface{}
+	if err := json.NewDecoder(rec.Body).Decode(&getResp); err != nil {
+		t.Fatalf("decode GET response: %v", err)
+	}
+	if bias, _ := getResp["cacheReadBias"].(float64); bias != 0 {
+		t.Fatalf("expected default cacheReadBias=0, got %v", bias)
+	}
+
+	// POST /settings with cacheReadBias=0.7
+	body := strings.NewReader(`{"cacheReadBias": 0.7}`)
+	req = httptest.NewRequest("POST", "/api/settings", body)
+	rec = httptest.NewRecorder()
+	h.apiUpdateSettings(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("POST /settings status %d, body: %s", rec.Code, rec.Body.String())
+	}
+
+	// Verify it took effect immediately via config getter
+	got := config.GetCacheReadBias()
+	if got != 0.7 {
+		t.Fatalf("expected GetCacheReadBias()=0.7 after POST, got %v", got)
+	}
+
+	// GET /settings should now reflect the new value
+	req = httptest.NewRequest("GET", "/api/settings", nil)
+	rec = httptest.NewRecorder()
+	h.apiGetSettings(rec, req)
+	var getResp2 map[string]interface{}
+	if err := json.NewDecoder(rec.Body).Decode(&getResp2); err != nil {
+		t.Fatalf("decode second GET response: %v", err)
+	}
+	if bias, _ := getResp2["cacheReadBias"].(float64); bias != 0.7 {
+		t.Fatalf("expected cacheReadBias=0.7 in GET response, got %v", bias)
+	}
+}
