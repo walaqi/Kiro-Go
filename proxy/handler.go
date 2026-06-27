@@ -9,6 +9,7 @@ import (
 	"kiro-go/logger"
 	"kiro-go/pool"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -34,6 +35,7 @@ type RequestLog struct {
 }
 
 const requestLogsMaxSize = 500
+const errorLogsMaxSize = 500
 
 // Handler HTTP 处理器
 type Handler struct {
@@ -54,8 +56,9 @@ type Handler struct {
 	modelsCacheTime int64
 	promptCache     *promptCacheTracker
 	tokenRefreshMu  sync.Mutex
-	// 请求日志 (环形缓冲区，包含成功和失败)
+	// 请求日志 (环形缓冲区，成功和错误分开存储)
 	requestLogs   []RequestLog
+	errorLogs     []RequestLog
 	requestLogsMu sync.RWMutex
 }
 
@@ -1428,13 +1431,23 @@ func (h *Handler) recordSuccessLog(endpoint, model, accountID string, tokens int
 
 func (h *Handler) appendRequestLog(entry RequestLog) {
 	h.requestLogsMu.Lock()
-	if h.requestLogs == nil {
-		h.requestLogs = make([]RequestLog, 0, requestLogsMaxSize)
+	if entry.Status == "error" {
+		if h.errorLogs == nil {
+			h.errorLogs = make([]RequestLog, 0, errorLogsMaxSize)
+		}
+		if len(h.errorLogs) >= errorLogsMaxSize {
+			h.errorLogs = h.errorLogs[1:]
+		}
+		h.errorLogs = append(h.errorLogs, entry)
+	} else {
+		if h.requestLogs == nil {
+			h.requestLogs = make([]RequestLog, 0, requestLogsMaxSize)
+		}
+		if len(h.requestLogs) >= requestLogsMaxSize {
+			h.requestLogs = h.requestLogs[1:]
+		}
+		h.requestLogs = append(h.requestLogs, entry)
 	}
-	if len(h.requestLogs) >= requestLogsMaxSize {
-		h.requestLogs = h.requestLogs[1:]
-	}
-	h.requestLogs = append(h.requestLogs, entry)
 	h.requestLogsMu.Unlock()
 }
 
@@ -1456,18 +1469,22 @@ func classifyError(msg string) string {
 	}
 }
 
-// getRequestLogs returns a copy of request logs (newest first).
+// getRequestLogs returns a merged copy of success + error logs (newest first).
 func (h *Handler) getRequestLogs() []RequestLog {
 	h.requestLogsMu.RLock()
 	defer h.requestLogsMu.RUnlock()
-	if len(h.requestLogs) == 0 {
+	total := len(h.requestLogs) + len(h.errorLogs)
+	if total == 0 {
 		return []RequestLog{}
 	}
-	result := make([]RequestLog, len(h.requestLogs))
-	for i, e := range h.requestLogs {
-		result[len(h.requestLogs)-1-i] = e
-	}
-	return result
+	merged := make([]RequestLog, 0, total)
+	merged = append(merged, h.requestLogs...)
+	merged = append(merged, h.errorLogs...)
+	// 按时间降序排列（newest first）
+	sort.Slice(merged, func(i, j int) bool {
+		return merged[i].Time > merged[j].Time
+	})
+	return merged
 }
 
 // handleClaudeNonStream Claude 非流式响应
@@ -3242,6 +3259,7 @@ func (h *Handler) apiGetLogs(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) apiClearLogs(w http.ResponseWriter, r *http.Request) {
 	h.requestLogsMu.Lock()
 	h.requestLogs = h.requestLogs[:0]
+	h.errorLogs = h.errorLogs[:0]
 	h.requestLogsMu.Unlock()
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
