@@ -323,3 +323,103 @@ func TestReloadDropsOverQuotaAccountWhenAllowOverUsageDisabled(t *testing.T) {
 		t.Fatalf("expected over-quota account to be dropped, got %q", got.ID)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Usage-balanced selection within same-weight tier
+// ---------------------------------------------------------------------------
+
+func TestSelectByUsageFavorsLowerConsumption(t *testing.T) {
+	// Account "low" has much lower usage than "high".
+	// Over many iterations, "low" should be selected significantly more often.
+	low := &config.Account{ID: "low", UsageCurrent: 1000}
+	high := &config.Account{ID: "high", UsageCurrent: 9000}
+	candidates := []*config.Account{low, high}
+
+	counts := map[string]int{}
+	const iterations = 10000
+	for i := 0; i < iterations; i++ {
+		acc := selectByUsage(candidates)
+		counts[acc.ID]++
+	}
+
+	// "low" should get the vast majority (expect >70%)
+	lowPct := float64(counts["low"]) / float64(iterations)
+	if lowPct < 0.65 {
+		t.Errorf("expected low-usage account to be selected >65%% of the time, got %.1f%%", lowPct*100)
+	}
+	// "high" should still get some hits (not zero — randomness)
+	if counts["high"] == 0 {
+		t.Error("expected high-usage account to be selected at least sometimes")
+	}
+}
+
+func TestSelectByUsageConvergesToUniform(t *testing.T) {
+	// When usage is equal, selection should be roughly uniform.
+	a := &config.Account{ID: "a", UsageCurrent: 5000}
+	b := &config.Account{ID: "b", UsageCurrent: 5000}
+	c := &config.Account{ID: "c", UsageCurrent: 5000}
+	candidates := []*config.Account{a, b, c}
+
+	counts := map[string]int{}
+	const iterations = 10000
+	for i := 0; i < iterations; i++ {
+		acc := selectByUsage(candidates)
+		counts[acc.ID]++
+	}
+
+	// Each should get roughly 33%, allow 20%-46% range
+	for _, id := range []string{"a", "b", "c"} {
+		pct := float64(counts[id]) / float64(iterations)
+		if pct < 0.20 || pct > 0.46 {
+			t.Errorf("account %q got %.1f%%, expected roughly 33%%", id, pct*100)
+		}
+	}
+}
+
+func TestSelectByUsageSingleCandidate(t *testing.T) {
+	only := &config.Account{ID: "only", UsageCurrent: 500}
+	acc := selectByUsage([]*config.Account{only})
+	if acc.ID != "only" {
+		t.Fatalf("expected 'only', got %q", acc.ID)
+	}
+}
+
+func TestGetNextSelectsFromSameWeightTier(t *testing.T) {
+	// Two accounts with weight=5, one with weight=1.
+	// The weight=1 account should never be selected when weight=5 accounts are available.
+	p := newTestPool(
+		config.Account{ID: "high-a", Weight: 5, UsageCurrent: 100},
+		config.Account{ID: "high-b", Weight: 5, UsageCurrent: 200},
+		config.Account{ID: "low", Weight: 1, UsageCurrent: 0},
+	)
+
+	counts := map[string]int{}
+	for i := 0; i < 100; i++ {
+		acc := p.GetNext()
+		if acc == nil {
+			t.Fatal("expected account, got nil")
+		}
+		counts[acc.ID]++
+	}
+
+	if counts["low"] > 0 {
+		t.Errorf("lower-weight account should not be selected when higher-weight accounts are available, got %d hits", counts["low"])
+	}
+	if counts["high-a"] == 0 || counts["high-b"] == 0 {
+		t.Errorf("both same-weight accounts should be selected: high-a=%d, high-b=%d", counts["high-a"], counts["high-b"])
+	}
+}
+
+func TestGetNextFallsBackToLowerTier(t *testing.T) {
+	// High-weight account is in cooldown; should fallback to low-weight.
+	p := newTestPool(
+		config.Account{ID: "high", Weight: 5},
+		config.Account{ID: "low", Weight: 1},
+	)
+	p.cooldowns["high"] = time.Now().Add(time.Hour)
+
+	acc := p.GetNext()
+	if acc == nil || acc.ID != "low" {
+		t.Fatalf("expected fallback to low-weight account, got %#v", acc)
+	}
+}
