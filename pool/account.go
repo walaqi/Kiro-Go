@@ -4,6 +4,7 @@ package pool
 
 import (
 	"kiro-go/config"
+	"math/rand"
 	"sort"
 	"strings"
 	"sync"
@@ -63,13 +64,14 @@ func (p *AccountPool) Reload() {
 	p.totalAccounts = len(enabled)
 }
 
-// GetNext 获取下一个可用账号（加权轮询）
+// GetNext 获取下一个可用账号
 func (p *AccountPool) GetNext() *config.Account {
 	return p.GetNextExcluding(nil)
 }
 
-// GetNextExcluding 获取优先级最高的可用账号，并跳过指定账号。
-// 账号已按权重降序排列，从头扫描返回第一个满足条件的。
+// GetNextExcluding 获取下一个可用账号，并跳过指定账号。
+// 按权重分层：先尝试最高权重层，层内按消耗均衡的加权随机选择。
+// 若整层无可用账号，降级到下一层。
 func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -81,8 +83,18 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 	allowOverUsage := config.GetAllowOverUsage()
 	now := time.Now()
 
+	// 收集最高可用权重层的所有候选账号
+	var candidates []*config.Account
+	var tierWeight int
+
 	for i := range p.accounts {
 		acc := &p.accounts[i]
+		w := effectiveWeight(acc.Weight)
+
+		// 已有候选且进入了更低权重层，停止
+		if len(candidates) > 0 && w < tierWeight {
+			break
+		}
 
 		if excluded != nil && excluded[acc.ID] {
 			continue
@@ -96,7 +108,15 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 		if isQuotaBlocked(*acc, allowOverUsage) {
 			continue
 		}
-		return acc
+
+		if len(candidates) == 0 {
+			tierWeight = w
+		}
+		candidates = append(candidates, acc)
+	}
+
+	if len(candidates) > 0 {
+		return selectByUsage(candidates)
 	}
 
 	// 无可用账号，返回冷却时间最短的（排除额度用尽的，除非允许超额）
@@ -166,7 +186,7 @@ func (p *AccountPool) GetNextForModel(model string) *config.Account {
 	return p.GetNextForModelExcluding(model, nil)
 }
 
-// GetNextForModelExcluding 获取优先级最高且支持指定模型的可用账号，并跳过指定账号。
+// GetNextForModelExcluding 获取支持指定模型的可用账号，同权重层内按消耗均衡选择。
 func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string]bool) *config.Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -178,8 +198,17 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 	allowOverUsage := config.GetAllowOverUsage()
 	now := time.Now()
 
+	// 按权重分层收集候选
+	var candidates []*config.Account
+	var tierWeight int
+
 	for i := range p.accounts {
 		acc := &p.accounts[i]
+		w := effectiveWeight(acc.Weight)
+
+		if len(candidates) > 0 && w < tierWeight {
+			break
+		}
 
 		if excluded != nil && excluded[acc.ID] {
 			continue
@@ -196,7 +225,15 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 		if isQuotaBlocked(*acc, allowOverUsage) {
 			continue
 		}
-		return acc
+
+		if len(candidates) == 0 {
+			tierWeight = w
+		}
+		candidates = append(candidates, acc)
+	}
+
+	if len(candidates) > 0 {
+		return selectByUsage(candidates)
 	}
 
 	// fallback：找冷却时间最短且支持该模型的账号
@@ -468,4 +505,45 @@ func effectiveWeight(weight int) int {
 		return 1
 	}
 	return weight
+}
+
+// selectByUsage 在候选账号中按消耗均衡的加权随机选择。
+// 权重 = (组内最大消耗 - 本账号消耗 + baseline)，消耗越低命中概率越高，
+// baseline 保证消耗相近时仍有分散效果而非总选同一个。
+func selectByUsage(candidates []*config.Account) *config.Account {
+	if len(candidates) == 1 {
+		return candidates[0]
+	}
+
+	// 找组内最大消耗
+	maxUsage := candidates[0].UsageCurrent
+	for _, acc := range candidates[1:] {
+		if acc.UsageCurrent > maxUsage {
+			maxUsage = acc.UsageCurrent
+		}
+	}
+
+	// baseline: 最大消耗的 20%（最低 1.0），保证差距收敛后仍有随机分散
+	baseline := maxUsage * 0.2
+	if baseline < 1.0 {
+		baseline = 1.0
+	}
+
+	// 计算加权随机
+	weights := make([]float64, len(candidates))
+	var totalWeight float64
+	for i, acc := range candidates {
+		w := maxUsage - acc.UsageCurrent + baseline
+		weights[i] = w
+		totalWeight += w
+	}
+
+	r := rand.Float64() * totalWeight
+	for i, w := range weights {
+		r -= w
+		if r <= 0 {
+			return candidates[i]
+		}
+	}
+	return candidates[len(candidates)-1]
 }
