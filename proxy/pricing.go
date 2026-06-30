@@ -118,44 +118,29 @@ func pricingLookupCandidates(model string) []string {
 	return candidates
 }
 
-// calibrateScaledUsage redistributes the inferred prompt-cache tokens between
-// the cache_read and cache_creation buckets so that the total list-price cost
-// of the reported usage matches the dollar value implied by the upstream
-// credits, while holding the *total* cache token count fixed (token
-// conservation).
+// calibrateScaledUsage rescales only the cache usage components
+// (cache_read, cache_creation) so that the total list-price cost of the
+// reported usage matches the dollar value implied by the upstream credits.
+// Both input_tokens and output_tokens are held fixed: input_tokens must not
+// change to avoid disturbing client compaction signals, and output_tokens is
+// a direct local count of generated text that should be reported as-is.
 //
-// Upstream Kiro reports only a single credits scalar, never token counts. Both
-// input_tokens and output_tokens are held fixed (local tiktoken estimates).
-// The total cache token count C = cache_read + cache_creation is also trusted —
-// it reflects the observed context structure (estimatedInput - billedInput).
-// The only genuinely uncertain quantity is how C splits between the cheap
-// "read" bucket and the expensive "creation" buckets (this depends on cache
-// timing that upstream never reveals), so that split is the single free
-// variable. We solve it so the cache dollars equal the residual budget V:
+// Before solving the scale, an optional CacheReadBias b in [0,1) shifts that
+// fraction of the inferred cache_creation totals (5m and 1h) into cache_read,
+// so the displayed cache hit ratio rises while the total billed dollars remain
+// pinned to credits*CreditsToUSD by the subsequent scale solve.
 //
-//	read + cc = C                  (token conservation)
-//	read*p_cr + cc*p_c = V          (dollar alignment)
-//	  where V   = credits*CreditsToUSD - billedInput*p_in - output*p_out
-//	        p_c = creation price blended by the observed cc5m:cc1h ratio
+// The fixed cost is billedInput*input_price + output*output_price. The
+// variable cost is cache_read*p_cr + cc5m*p_5m + cc1h*p_1h (computed from the
+// post-bias values). We solve for s:
 //
-//	=> cc = (V - C*p_cr) / (p_c - p_cr),  read = C - cc
-//
-// When V falls outside the achievable band [C*p_cr, C*p_c] the split is clamped
-// to the nearest boundary (all-read or all-creation). We preserve token
-// conservation in preference to exact dollar alignment: fabricating an
-// impossible token distribution is worse for a Claude-compatible usage report
-// than a small dollar mismatch on an out-of-band request. The cc5m:cc1h ratio
-// is preserved across the redistribution.
-//
-// (CacheReadBias is intentionally NOT consulted: under split calibration the
-// read/creation ratio is fully determined by C and V, leaving no free degree
-// for a display-bias knob. The config field is retained as a legacy no-op.)
+//	fixedCost + s * variableCost = credits * CreditsToUSD
 //
 // Calibration is skipped (applied=false, inputs returned unchanged) when:
 //   - credits <= 0
 //   - model pricing is unknown
-//   - C <= 0 (no cache activity — nothing to split)
-//   - the pricing table is degenerate (creation price <= read price)
+//   - variableCost <= 0 (no cache activity — nothing to scale)
+//   - target <= fixedCost (scale would be <=0; logs a warning)
 func calibrateScaledUsage(model string, credits float64, billedInput, output int, usage promptCacheUsage) (int, promptCacheUsage, bool) {
 	if credits <= 0 {
 		return output, usage, false
@@ -166,92 +151,59 @@ func calibrateScaledUsage(model string, credits float64, billedInput, output int
 		return output, usage, false
 	}
 
-	// The conserved total C must use the SAME creation field the caller used to
-	// derive billedInput (billedClaudeInputTokens subtracts the top-level
-	// CacheCreationInputTokens, not the 5m/1h breakdown sum). The breakdown and
-	// the top-level total are NOT guaranteed equal: the min-cacheable threshold
-	// can zero the top-level creation while the TTL breakdown stays nonzero, and
-	// the 85% cap can shrink the top-level creation below the breakdown sum (see
-	// cache_tracker.go). Conserving against the breakdown sum would satisfy
-	// read+cc5m+cc1h==breakdown but break the client-visible invariant
-	// billedInput + read + cache_creation == estimatedInput. So C is built from
-	// the reported creation total; the 5m/1h fields are used ONLY as a ratio
-	// hint for re-splitting the solved creation amount.
-	cc5mOrig := usage.CacheCreation5mInputTokens
-	cc1hOrig := usage.CacheCreation1hInputTokens
-	ratioDenom := cc5mOrig + cc1hOrig // breakdown sum — split-ratio hint only
-	ccTotalReported := usage.CacheCreationInputTokens
-	total := usage.CacheReadInputTokens + ccTotalReported // C
-	if total <= 0 {
-		// No cache activity — nothing to split.
+	bias := config.GetCacheReadBias()
+	read := float64(usage.CacheReadInputTokens)
+	cc5m := float64(usage.CacheCreation5mInputTokens)
+	cc1h := float64(usage.CacheCreation1hInputTokens)
+	if bias > 0 {
+		shifted5m := cc5m * bias
+		shifted1h := cc1h * bias
+		read += shifted5m + shifted1h
+		cc5m -= shifted5m
+		cc1h -= shifted1h
+	}
+
+	variableCost := read*pricing.CacheReadInputTokenCost +
+		cc5m*pricing.CacheCreationInputTokenCost +
+		cc1h*pricing.CacheCreation1hInputTokenCost
+	if variableCost <= 0 {
+		// No cache activity — nothing to scale.
 		return output, usage, false
 	}
 
-	// Creation price blended by the observed 5m:1h ratio. When no breakdown is
-	// available, any creation derived below is routed to the 5m bucket, so use
-	// the 5m creation price as the blended creation price.
-	pRead := pricing.CacheReadInputTokenCost
-	var pCreation float64
-	if ratioDenom > 0 {
-		pCreation = (float64(cc5mOrig)*pricing.CacheCreationInputTokenCost +
-			float64(cc1hOrig)*pricing.CacheCreation1hInputTokenCost) / float64(ratioDenom)
-	} else {
-		pCreation = pricing.CacheCreationInputTokenCost
-	}
-	if pCreation <= pRead {
-		// Degenerate pricing — cannot differentiate read from creation.
-		return output, usage, false
-	}
-
-	C := float64(total)
-	V := credits*config.GetCreditsToUSD() -
-		float64(billedInput)*pricing.InputCostPerToken -
+	target := credits * config.GetCreditsToUSD()
+	fixedCost := float64(billedInput)*pricing.InputCostPerToken +
 		float64(output)*pricing.OutputCostPerToken
-
-	// Solve the split, clamping to the achievable band [C*pRead, C*pCreation].
-	var ccFloat float64
-	switch {
-	case V <= C*pRead:
-		ccFloat = 0 // V below all-read cost: clamp to all read.
-		logger.Debugf("credit calibration clamped to all-read for model %s: V=$%.6f <= floor $%.6f (credits=%.4f)", model, V, C*pRead, credits)
-	case V >= C*pCreation:
-		ccFloat = C // V above all-creation cost: clamp to all creation.
-		logger.Debugf("credit calibration clamped to all-creation for model %s: V=$%.6f >= ceil $%.6f (credits=%.4f)", model, V, C*pCreation, credits)
-	default:
-		ccFloat = (V - C*pRead) / (pCreation - pRead)
+	scale := (target - fixedCost) / variableCost
+	if scale <= 0 {
+		logger.Warnf("credit calibration skipped for model %s: target $%.6f below fixed cost $%.6f (credits=%.4f)", model, target, fixedCost, credits)
+		return output, usage, false
 	}
 
-	// Round into integers while preserving conservation: cache_read absorbs the
-	// rounding remainder so read + cache_creation(top-level) == total exactly
-	// (the top-level creation is reset to cc5m+cc1h below).
-	ccTotal := int(math.Round(ccFloat))
-	if ccTotal < 0 {
-		ccTotal = 0
-	} else if ccTotal > total {
-		ccTotal = total
-	}
-	read := total - ccTotal
-
-	// Re-split the solved creation total across 5m/1h preserving the observed
-	// breakdown ratio (or all to 5m when no breakdown is available).
-	var cc5m, cc1h int
-	if ccTotal > 0 {
-		if ratioDenom > 0 {
-			cc5m = int(math.Round(float64(ccTotal) * float64(cc5mOrig) / float64(ratioDenom)))
-			if cc5m > ccTotal {
-				cc5m = ccTotal
-			}
-			cc1h = ccTotal - cc5m
-		} else {
-			cc5m = ccTotal
-		}
-	}
+	scaledRead := scaleFloatToken(read, scale)
+	scaled5m := scaleFloatToken(cc5m, scale)
+	scaled1h := scaleFloatToken(cc1h, scale)
 
 	calibrated := usage
-	calibrated.CacheReadInputTokens = read
-	calibrated.CacheCreation5mInputTokens = cc5m
-	calibrated.CacheCreation1hInputTokens = cc1h
-	calibrated.CacheCreationInputTokens = cc5m + cc1h
+	calibrated.CacheReadInputTokens = scaledRead
+	calibrated.CacheCreation5mInputTokens = scaled5m
+	calibrated.CacheCreation1hInputTokens = scaled1h
+	calibrated.CacheCreationInputTokens = scaled5m + scaled1h
 
 	return output, calibrated, true
+}
+
+// scaleFloatToken multiplies a (possibly non-integer) token count by the scale
+// factor and rounds to the nearest non-negative integer. The float input lets
+// the caller pass already-redistributed totals (e.g. after the CacheReadBias
+// shift) without a premature integer round-trip.
+func scaleFloatToken(tokens float64, scale float64) int {
+	if tokens <= 0 {
+		return 0
+	}
+	scaled := int(math.Round(tokens * scale))
+	if scaled < 0 {
+		return 0
+	}
+	return scaled
 }

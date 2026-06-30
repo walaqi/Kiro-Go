@@ -262,19 +262,15 @@ type Config struct {
 	// clients; it does not change credit accounting or persisted statistics.
 	CreditsToUSD float64 `json:"creditsToUSD,omitempty"`
 
-	// CacheReadBias is a LEGACY NO-OP retained for config/API compatibility.
-	//
-	// It formerly shifted a fraction of inferred cache_creation tokens into
-	// cache_read before the old single-factor calibration scale was solved, to
-	// inflate the displayed cache hit ratio. Under the current split-based
-	// calibration (proxy/pricing.go calibrateScaledUsage) the read/creation
-	// split is fully determined by the trusted total cache token count C and
-	// the residual dollar budget V, leaving no free degree for a display bias —
-	// so this value no longer affects the reported usage in any way.
-	//
-	// The field, GetCacheReadBias, UpdateCacheReadBias, and the settings API
-	// round-trip are kept so existing config.json files and clients don't break;
-	// they may be removed in a future breaking cleanup.
+	// CacheReadBias shifts a fraction of inferred cache_creation tokens into
+	// cache_read before the credit calibration scale is solved. Range [0, 1):
+	// 0 leaves the cache_tracker breakdown untouched (default), values closer
+	// to 1 move more of the creation total into read so the displayed cache
+	// hit ratio is higher. The total list-price cost is still rebalanced to
+	// match credits*CreditsToUSD via the calibration scale, so input/output
+	// and overall billed dollars are unchanged. Like CreditsToUSD this is a
+	// server-side display knob and is intentionally not exposed in the admin
+	// UI; tune it via config.json after sampling real requests.
 	CacheReadBias float64 `json:"cacheReadBias,omitempty"`
 
 	// Pricing configures the source URLs for the background pricing-table updater
@@ -1066,10 +1062,9 @@ func UpdateCreditsToUSD(v float64) error {
 	return Save()
 }
 
-// GetCacheReadBias returns the persisted cache-read bias value, clamped to
-// [0, 1). LEGACY NO-OP: this value no longer influences usage calibration (see
-// the field doc on Config.CacheReadBias and proxy/pricing.go). Retained only
-// for settings-API round-trip compatibility.
+// GetCacheReadBias returns the fraction of inferred cache_creation tokens that
+// the calibrator should shift into cache_read before solving for the scale.
+// Clamped to [0, 1); out-of-range or unset values yield 0 (no shift).
 func GetCacheReadBias() float64 {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
@@ -1086,9 +1081,9 @@ func GetCacheReadBias() float64 {
 	return b
 }
 
-// UpdateCacheReadBias persists the cache-read bias value. LEGACY NO-OP: the
-// stored value no longer affects usage calibration (see Config.CacheReadBias).
-// Retained for settings-API round-trip compatibility and test use.
+// UpdateCacheReadBias sets the cache-read display-bias factor and persists the
+// change. Provided for completeness/test use; the value is intentionally not
+// exposed in the admin UI (see field doc on Config.CacheReadBias).
 func UpdateCacheReadBias(v float64) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
