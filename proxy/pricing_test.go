@@ -18,6 +18,14 @@ func totalListPriceCost(p modelPricing, billedInput, output int, usage promptCac
 		float64(usage.CacheCreation1hInputTokens)*p.CacheCreation1hInputTokenCost
 }
 
+// conservedCacheTotal returns C = cache_read + cache_creation(top-level) for
+// conservation assertions. C uses the top-level CacheCreationInputTokens — the
+// same field billedClaudeInputTokens subtracts — NOT the 5m/1h breakdown sum,
+// which is not guaranteed equal to it (see calibrateScaledUsage).
+func conservedCacheTotal(u promptCacheUsage) int {
+	return u.CacheReadInputTokens + u.CacheCreationInputTokens
+}
+
 func TestLookupModelPricing(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -45,7 +53,10 @@ func TestLookupModelPricing(t *testing.T) {
 	}
 }
 
-func TestCalibrateScaledUsageHitsTarget(t *testing.T) {
+// TestCalibrateSplitHitsTarget verifies that when the dollar budget V falls
+// inside the achievable band, the split is solved so the reported cost matches
+// the target exactly, while the total cache token count is conserved.
+func TestCalibrateSplitHitsTarget(t *testing.T) {
 	model := "claude-sonnet-4.5"
 	pricing, ok := lookupModelPricing(model)
 	if !ok {
@@ -60,61 +71,200 @@ func TestCalibrateScaledUsageHitsTarget(t *testing.T) {
 		CacheCreation1hInputTokens: 200,
 		CacheCreationInputTokens:   1200,
 	}
+	C := conservedCacheTotal(usage)
 
-	// Choose credits so the target sits comfortably above the fixed input cost,
-	// forcing a real (positive) scale factor.
-	credits := 1.0
-	target := credits * 0.2 // default CreditsToUSD when config is uninitialized
+	// Pick credits so the residual budget V lands strictly inside the band
+	// [C*p_cr, C*p_creation_blended], forcing a genuine interior split.
+	pBlended := (1000*pricing.CacheCreationInputTokenCost + 200*pricing.CacheCreation1hInputTokenCost) / 1200
+	fixed := float64(billedInput)*pricing.InputCostPerToken + float64(output)*pricing.OutputCostPerToken
+	midV := float64(C) * (pricing.CacheReadInputTokenCost + pBlended) / 2 // band midpoint
+	credits := (fixed + midV) / config.GetCreditsToUSD()
 
 	gotOutput, gotUsage, applied := calibrateScaledUsage(model, credits, billedInput, output, usage)
 	if !applied {
 		t.Fatalf("expected calibration to apply")
 	}
-
-	// output is fixed — only cache fields are scaled.
 	if gotOutput != output {
 		t.Fatalf("output must not change: got %d, want %d", gotOutput, output)
 	}
 
-	// input_tokens is never passed into or mutated by the calibrator; the billed
-	// input used for cost must remain the same value we provided.
-	costAfter := totalListPriceCost(pricing, billedInput, gotOutput, gotUsage)
-	// Tolerance: a few tokens worth of rounding error across four scaled fields.
-	tol := 10 * pricing.OutputCostPerToken
-	if math.Abs(costAfter-target) > tol {
-		t.Fatalf("calibrated cost $%.6f not within $%.6f of target $%.6f", costAfter, tol, target)
+	// Token conservation: the total cache token count is held fixed.
+	if got := conservedCacheTotal(gotUsage); got != C {
+		t.Fatalf("cache token conservation violated: got C=%d, want %d", got, C)
 	}
 
-	// cache_creation must equal the sum of its 5m/1h breakdown after scaling.
+	// cache_creation must equal the sum of its 5m/1h breakdown.
 	if gotUsage.CacheCreationInputTokens != gotUsage.CacheCreation5mInputTokens+gotUsage.CacheCreation1hInputTokens {
 		t.Fatalf("cache_creation %d != 5m %d + 1h %d",
 			gotUsage.CacheCreationInputTokens, gotUsage.CacheCreation5mInputTokens, gotUsage.CacheCreation1hInputTokens)
 	}
+
+	// Dollar alignment: reported cost matches the target within rounding noise.
+	target := credits * config.GetCreditsToUSD()
+	costAfter := totalListPriceCost(pricing, billedInput, gotOutput, gotUsage)
+	tol := 2 * pricing.CacheCreationInputTokenCost // a couple tokens of rounding
+	if math.Abs(costAfter-target) > tol {
+		t.Fatalf("calibrated cost $%.6f not within $%.6f of target $%.6f", costAfter, tol, target)
+	}
 }
 
-func TestCalibrateScaledUsageScaleDown(t *testing.T) {
+// TestCalibrateSplitClampLow verifies that when the budget V is below the
+// all-read floor, the split clamps to all cache_read (cheapest) and conserves
+// the total. Dollar alignment is intentionally sacrificed in this out-of-band
+// case to preserve a physically valid token distribution.
+func TestCalibrateSplitClampLow(t *testing.T) {
 	model := "claude-sonnet-4.5"
+	pricing, ok := lookupModelPricing(model)
+	if !ok {
+		t.Fatalf("expected pricing for %s", model)
+	}
+
+	billedInput := 500
+	output := 1000
 	usage := promptCacheUsage{
 		CacheReadInputTokens:       4000,
 		CacheCreation5mInputTokens: 2000,
 		CacheCreationInputTokens:   2000,
 	}
-	output := 1000
+	C := conservedCacheTotal(usage)
 
-	// Small credits => target below the unscaled variable cost but still above
-	// the fixed cost => scale in (0,1).
-	credits := 0.1
-	gotOutput, gotUsage, applied := calibrateScaledUsage(model, credits, 500, output, usage)
+	// Tiny credits => V below C*p_cr => clamp to all-read.
+	credits := 0.05
+	_, gotUsage, applied := calibrateScaledUsage(model, credits, billedInput, output, usage)
 	if !applied {
-		t.Fatalf("expected calibration to apply for scale-down case")
+		t.Fatalf("expected calibration to apply for clamp-low case")
 	}
-	// output is now fixed — only cache fields are scaled.
-	if gotOutput != output {
-		t.Fatalf("output must not change: got %d, want %d", gotOutput, output)
+	if gotUsage.CacheReadInputTokens != C {
+		t.Fatalf("expected all tokens routed to cache_read: got read=%d, want %d", gotUsage.CacheReadInputTokens, C)
 	}
-	if gotUsage.CacheReadInputTokens >= usage.CacheReadInputTokens {
-		t.Fatalf("expected cache_read to shrink, got %d (was %d)", gotUsage.CacheReadInputTokens, usage.CacheReadInputTokens)
+	if gotUsage.CacheCreationInputTokens != 0 {
+		t.Fatalf("expected zero cache_creation under clamp-low, got %d", gotUsage.CacheCreationInputTokens)
 	}
+	if got := conservedCacheTotal(gotUsage); got != C {
+		t.Fatalf("conservation violated under clamp: got %d, want %d", got, C)
+	}
+	_ = pricing
+}
+
+// TestCalibrateSplitClampHigh verifies that when V exceeds the all-creation
+// ceiling, the split clamps to all cache_creation (most expensive) and conserves
+// the total.
+func TestCalibrateSplitClampHigh(t *testing.T) {
+	model := "claude-sonnet-4.5"
+	pricing, ok := lookupModelPricing(model)
+	if !ok {
+		t.Fatalf("expected pricing for %s", model)
+	}
+
+	billedInput := 100
+	output := 100
+	usage := promptCacheUsage{
+		CacheReadInputTokens:       3000,
+		CacheCreation5mInputTokens: 1000,
+		CacheCreationInputTokens:   1000,
+	}
+	C := conservedCacheTotal(usage)
+
+	// Choose credits so V > C*p_creation (all-creation ceiling).
+	fixed := float64(billedInput)*pricing.InputCostPerToken + float64(output)*pricing.OutputCostPerToken
+	overV := float64(C) * pricing.CacheCreationInputTokenCost * 1.5
+	credits := (fixed + overV) / config.GetCreditsToUSD()
+
+	_, gotUsage, applied := calibrateScaledUsage(model, credits, billedInput, output, usage)
+	if !applied {
+		t.Fatalf("expected calibration to apply for clamp-high case")
+	}
+	if gotUsage.CacheReadInputTokens != 0 {
+		t.Fatalf("expected zero cache_read under clamp-high, got %d", gotUsage.CacheReadInputTokens)
+	}
+	if got := conservedCacheTotal(gotUsage); got != C {
+		t.Fatalf("conservation violated under clamp-high: got %d, want %d", got, C)
+	}
+	// All creation, split should preserve the original 5m:1h ratio (here all 5m).
+	if gotUsage.CacheCreation5mInputTokens != C {
+		t.Fatalf("expected all creation in 5m bucket, got 5m=%d 1h=%d", gotUsage.CacheCreation5mInputTokens, gotUsage.CacheCreation1hInputTokens)
+	}
+}
+
+// TestCalibrateSplitConservesAlways sweeps a range of credit values and asserts
+// that token conservation (read + cache_creation(top-level) == C) holds for
+// every applied calibration, interior or clamped.
+func TestCalibrateSplitConservesAlways(t *testing.T) {
+	model := "claude-sonnet-4.5"
+	usage := promptCacheUsage{
+		CacheReadInputTokens:       2500,
+		CacheCreation5mInputTokens: 1500,
+		CacheCreation1hInputTokens: 500,
+		CacheCreationInputTokens:   2000,
+	}
+	C := conservedCacheTotal(usage)
+	for _, credits := range []float64{0.01, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0} {
+		_, gotUsage, applied := calibrateScaledUsage(model, credits, 800, 600, usage)
+		if !applied {
+			continue
+		}
+		if got := conservedCacheTotal(gotUsage); got != C {
+			t.Fatalf("conservation violated at credits=%.2f: got %d, want %d", credits, got, C)
+		}
+		if gotUsage.CacheCreationInputTokens != gotUsage.CacheCreation5mInputTokens+gotUsage.CacheCreation1hInputTokens {
+			t.Fatalf("creation breakdown inconsistent at credits=%.2f", credits)
+		}
+	}
+}
+
+// TestCalibrateSplitTopLevelCreationIsTheConservedTotal guards the C-source
+// invariant: the conserved total must come from the top-level
+// CacheCreationInputTokens (the field billedClaudeInputTokens subtracts), NOT
+// the 5m/1h breakdown sum. cache_tracker.go can emit usage where the top-level
+// creation is zeroed (min-cacheable threshold) or capped (85% rule) while the
+// TTL breakdown stays nonzero. Conserving against the breakdown sum would
+// fabricate cache tokens that break billedInput + read + creation ==
+// estimatedInput.
+func TestCalibrateSplitTopLevelCreationIsTheConservedTotal(t *testing.T) {
+	model := "claude-sonnet-4.5"
+
+	t.Run("zeroed top-level creation with nonzero breakdown", func(t *testing.T) {
+		// Top-level creation forced to 0 by the min-cacheable threshold, but the
+		// TTL breakdown still reports 900. No read either => C == 0 => skip.
+		// Calibration must NOT invent 900 creation tokens here.
+		usage := promptCacheUsage{
+			CacheCreationInputTokens:   0,
+			CacheReadInputTokens:       0,
+			CacheCreation5mInputTokens: 900,
+			CacheCreation1hInputTokens: 0,
+		}
+		_, gotUsage, applied := calibrateScaledUsage(model, 1.0, 1000, 500, usage)
+		if applied {
+			t.Fatalf("expected skip: C derives from top-level creation (0)+read (0)=0, got applied with %+v", gotUsage)
+		}
+		if gotUsage != usage {
+			t.Fatalf("usage must be returned unchanged on skip, got %+v", gotUsage)
+		}
+	})
+
+	t.Run("capped top-level creation below breakdown sum", func(t *testing.T) {
+		// Top-level creation capped to 1000 while the breakdown sums to 1500.
+		// C must be read(500)+1000=1500, conserving against the top-level total,
+		// NOT read+breakdown(500+1500=2000).
+		usage := promptCacheUsage{
+			CacheCreationInputTokens:   1000,
+			CacheReadInputTokens:       500,
+			CacheCreation5mInputTokens: 1200,
+			CacheCreation1hInputTokens: 300,
+		}
+		wantC := usage.CacheReadInputTokens + usage.CacheCreationInputTokens // 1500
+		_, gotUsage, applied := calibrateScaledUsage(model, 1.0, 800, 400, usage)
+		if !applied {
+			t.Fatalf("expected calibration to apply")
+		}
+		if got := conservedCacheTotal(gotUsage); got != wantC {
+			t.Fatalf("C must conserve against top-level creation: got %d, want %d", got, wantC)
+		}
+		if gotUsage.CacheReadInputTokens+gotUsage.CacheCreationInputTokens != wantC {
+			t.Fatalf("read+creation must equal C=%d, got read=%d creation=%d",
+				wantC, gotUsage.CacheReadInputTokens, gotUsage.CacheCreationInputTokens)
+		}
+	})
 }
 
 func TestCalibrateScaledUsageSkips(t *testing.T) {
@@ -151,21 +301,12 @@ func TestCalibrateScaledUsageSkips(t *testing.T) {
 		}
 	})
 
-	t.Run("nothing to scale", func(t *testing.T) {
-		// No output and no cache activity => variable cost is zero.
+	t.Run("no cache activity", func(t *testing.T) {
+		// No cache tokens => C == 0 => nothing to split.
 		empty := promptCacheUsage{}
 		_, _, applied := calibrateScaledUsage("claude-sonnet-4.5", 1.0, 1000, 0, empty)
 		if applied {
-			t.Fatalf("expected skip when there is nothing to scale")
-		}
-	})
-
-	t.Run("target below fixed input cost", func(t *testing.T) {
-		// Huge input, tiny credits => target dollar amount is far below the fixed
-		// input list-price cost, so scale would be <= 0.
-		_, _, applied := calibrateScaledUsage("claude-sonnet-4.5", 0.0001, 5_000_000, 500, usage)
-		if applied {
-			t.Fatalf("expected skip when target is below fixed input cost")
+			t.Fatalf("expected skip when there is no cache activity")
 		}
 	})
 }
@@ -184,7 +325,11 @@ func TestCalibrateScaledUsageDoesNotMutateInputUsage(t *testing.T) {
 	}
 }
 
-func TestCalibrateScaledUsageCacheReadBias(t *testing.T) {
+// TestCacheReadBiasIsNoOp confirms the legacy CacheReadBias knob no longer
+// influences calibration: identical inputs must yield identical usage
+// regardless of the configured bias value. (Round-trip of the setting itself is
+// covered by TestSettingsCacheReadBiasRoundTrip in handler_test.go.)
+func TestCacheReadBiasIsNoOp(t *testing.T) {
 	dir := t.TempDir()
 	if err := config.Init(filepath.Join(dir, "config.json")); err != nil {
 		t.Fatalf("config.Init: %v", err)
@@ -192,11 +337,6 @@ func TestCalibrateScaledUsageCacheReadBias(t *testing.T) {
 	t.Cleanup(func() { _ = config.UpdateCacheReadBias(0) })
 
 	model := "claude-sonnet-4.5"
-	pricing, ok := lookupModelPricing(model)
-	if !ok {
-		t.Fatalf("expected pricing for %s", model)
-	}
-
 	billedInput := 1000
 	output := 500
 	usage := promptCacheUsage{
@@ -206,7 +346,6 @@ func TestCalibrateScaledUsageCacheReadBias(t *testing.T) {
 		CacheCreationInputTokens:   1200,
 	}
 	credits := 1.0
-	target := credits * config.GetCreditsToUSD()
 
 	_, baseline, baseApplied := calibrateScaledUsage(model, credits, billedInput, output, usage)
 	if !baseApplied {
@@ -218,26 +357,10 @@ func TestCalibrateScaledUsageCacheReadBias(t *testing.T) {
 	}
 	_, biased, biasedApplied := calibrateScaledUsage(model, credits, billedInput, output, usage)
 	if !biasedApplied {
-		t.Fatalf("biased calibration must apply")
+		t.Fatalf("calibration must apply with bias set")
 	}
 
-	if biased.CacheReadInputTokens <= baseline.CacheReadInputTokens {
-		t.Fatalf("expected cache_read to grow under bias: baseline=%d biased=%d",
-			baseline.CacheReadInputTokens, biased.CacheReadInputTokens)
-	}
-	if biased.CacheCreationInputTokens >= baseline.CacheCreationInputTokens {
-		t.Fatalf("expected cache_creation to shrink under bias: baseline=%d biased=%d",
-			baseline.CacheCreationInputTokens, biased.CacheCreationInputTokens)
-	}
-	if biased.CacheCreationInputTokens != biased.CacheCreation5mInputTokens+biased.CacheCreation1hInputTokens {
-		t.Fatalf("cache_creation breakdown must remain consistent: total=%d 5m=%d 1h=%d",
-			biased.CacheCreationInputTokens, biased.CacheCreation5mInputTokens, biased.CacheCreation1hInputTokens)
-	}
-
-	costAfter := totalListPriceCost(pricing, billedInput, output, biased)
-	tol := 10 * pricing.OutputCostPerToken
-	if math.Abs(costAfter-target) > tol {
-		t.Fatalf("biased calibrated cost $%.6f not within $%.6f of target $%.6f",
-			costAfter, tol, target)
+	if biased != baseline {
+		t.Fatalf("CacheReadBias must be a no-op: baseline=%+v biased=%+v", baseline, biased)
 	}
 }
