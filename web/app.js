@@ -18,7 +18,7 @@
   let filterKeyword = '';
   let filterStatus = 'all';
   let privacyModeEnabled = true;
-  let filterConfig = { systemInjection: { enabled: false, position: 'prepend', text: '' }, systemReplaceRules: [], toolDescReplaceRules: [] };
+  let filterConfig = { systemInjection: { enabled: false, position: 'prepend', text: '' }, systemReplaceRules: [], toolDescReplaceRules: [], responseReplaceRules: [] };
   let builderIdSession = '';
   let builderIdPollTimer = null;
   let iamSession = '';
@@ -2023,7 +2023,8 @@
     filterConfig = {
       systemInjection: d.systemInjection || { enabled: false, position: 'prepend', text: '' },
       systemReplaceRules: d.systemReplaceRules || [],
-      toolDescReplaceRules: d.toolDescReplaceRules || []
+      toolDescReplaceRules: d.toolDescReplaceRules || [],
+      responseReplaceRules: d.responseReplaceRules || []
     };
     renderFilterTab();
   }
@@ -2044,6 +2045,7 @@
     radios.forEach(r => { r.checked = r.value === pos; });
     renderSystemReplaceRules();
     renderToolDescReplaceRules();
+    renderResponseReplaceRules();
   }
   function renderSystemReplaceRules() {
     const c = $('systemReplaceRules');
@@ -2091,9 +2093,36 @@
     filterConfig.systemReplaceRules.push({ id: 'sr-' + Date.now(), name: '', match: '', replace: '', enabled: true });
     renderSystemReplaceRules();
   }
+  function renderResponseReplaceRules() {
+    const c = $('responseReplaceRules');
+    if (!c) return;
+    const rules = filterConfig.responseReplaceRules;
+    if (!rules.length) {
+      c.innerHTML = '<small class="text-xs muted-text">' + escapeHtml(t('filter.noRules')) + '</small>';
+      return;
+    }
+    c.innerHTML = rules.map((r, i) =>
+      '<div class="rule-card' + (r.enabled ? '' : ' disabled') + '">' +
+      '<div class="rule-header">' +
+      '<label class="switch"><input type="checkbox" ' + (r.enabled ? 'checked' : '') + ' data-rr-toggle="' + i + '" /><span class="slider"></span></label>' +
+      '<div class="rule-meta"><input class="rule-name-input" value="' + escapeAttr(r.name || '') + '" data-rr-idx="' + i + '" data-rr-field="name" placeholder="' + escapeAttr(t('filter.unnamed')) + '" /></div>' +
+      '<button class="rule-remove" data-rr-remove="' + i + '" type="button" aria-label="' + escapeAttr(t('common.remove')) + '">&times;</button>' +
+      '</div>' +
+      '<div class="rule-body">' +
+      '<div class="rule-field"><label>' + escapeHtml(t('filter.match')) + '</label><input value="' + escapeAttr(r.match || '') + '" data-rr-idx="' + i + '" data-rr-field="match" /></div>' +
+      '<div class="rule-field"><label>' + escapeHtml(t('filter.replace')) + '</label><input value="' + escapeAttr(r.replace || '') + '" data-rr-idx="' + i + '" data-rr-field="replace" /></div>' +
+      '<div class="rule-field"><label class="inline-flex items-center gap-1"><input type="checkbox" ' + (r.isRegex ? 'checked' : '') + ' data-rr-regex="' + i + '" /> ' + escapeHtml(t('filter.isRegex')) + '</label></div>' +
+      '<div class="rule-field"><label>' + escapeHtml(t('filter.maxLen')) + '</label><input type="number" min="0" value="' + escapeAttr(String(r.maxLen || 0)) + '" data-rr-idx="' + i + '" data-rr-field="maxLen" /></div>' +
+      '</div></div>'
+    ).join('');
+  }
   function addToolDescReplaceRule() {
     filterConfig.toolDescReplaceRules.push({ id: 'td-' + Date.now(), toolName: '', description: '', enabled: true });
     renderToolDescReplaceRules();
+  }
+  function addResponseReplaceRule() {
+    filterConfig.responseReplaceRules.push({ id: 'rr-' + Date.now(), name: '', match: '', replace: '', isRegex: false, maxLen: 0, enabled: true });
+    renderResponseReplaceRules();
   }
 
   // Add-account modal templates
@@ -2935,6 +2964,27 @@
     $('toolDescReplaceRules').addEventListener('click', e => {
       const rm = e.target.closest('[data-td-remove]');
       if (rm) { filterConfig.toolDescReplaceRules.splice(parseInt(rm.dataset.tdRemove, 10), 1); renderToolDescReplaceRules(); }
+    });
+
+    $('addResponseReplaceBtn').addEventListener('click', addResponseReplaceRule);
+    $('responseReplaceRules').addEventListener('input', e => {
+      const idx = e.target.dataset.rrIdx;
+      const field = e.target.dataset.rrField;
+      if (idx != null && field) {
+        filterConfig.responseReplaceRules[idx][field] = field === 'maxLen' ? (parseInt(e.target.value, 10) || 0) : e.target.value;
+      }
+    });
+    $('responseReplaceRules').addEventListener('change', e => {
+      if (e.target.dataset.rrToggle != null) {
+        filterConfig.responseReplaceRules[e.target.dataset.rrToggle].enabled = e.target.checked;
+        renderResponseReplaceRules();
+      } else if (e.target.dataset.rrRegex != null) {
+        filterConfig.responseReplaceRules[e.target.dataset.rrRegex].isRegex = e.target.checked;
+      }
+    });
+    $('responseReplaceRules').addEventListener('click', e => {
+      const rm = e.target.closest('[data-rr-remove]');
+      if (rm) { filterConfig.responseReplaceRules.splice(parseInt(rm.dataset.rrRemove, 10), 1); renderResponseReplaceRules(); }
     });
   }
 

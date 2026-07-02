@@ -968,17 +968,33 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		var thinkingStarted bool
 		var eventThinkingOpen bool
 
+		// Response-content replacement over the VISIBLE answer text only. The
+		// filter holds back a bounded tail across frames so a match split across
+		// upstream chunks is never cut; thinking (modes 1-3) and tool_use are not
+		// routed through it. Inert (pass-through) when no rules are configured.
+		respFilter := newResponseReplaceFilter()
+
+		// sendVisible emits already-replaced visible answer text as a text_delta.
+		sendVisible := func(text string) {
+			if text == "" {
+				return
+			}
+			startContentBlock("text")
+			h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": activeBlockIndex,
+				"delta": map[string]string{"type": "text_delta", "text": text},
+			})
+		}
+
 		sendText := func(text string, thinkingState int) {
 			if thinkingState == 0 {
 				if text == "" {
 					return
 				}
-				startContentBlock("text")
-				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
-					"type":  "content_block_delta",
-					"index": activeBlockIndex,
-					"delta": map[string]string{"type": "text_delta", "text": text},
-				})
+				// Route visible text through the replacement filter; it returns
+				// only the prefix that no future chunk can retroactively change.
+				sendVisible(respFilter.feed(text))
 				return
 			}
 
@@ -1248,6 +1264,9 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		if eventThinkingOpen {
 			sendText("", 3)
 		}
+		// Emit any tail the response-replace filter held back for cross-frame
+		// match safety; no more input is coming, so it is final.
+		sendVisible(respFilter.flush())
 		closeActiveBlock()
 
 		// Upstream Kiro reports no input-token count, so the locally computed
@@ -1551,6 +1570,12 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 
 		thinkingFormat := thinkingOpts.Format
 		finalContent, extractedReasoning := extractThinkingFromContent(content)
+		// Response-content replacement over the visible answer only (thinking and
+		// tool args exempt). Same rules as the streaming path; here the whole body
+		// is present, so a single pass suffices.
+		if respRules := compileResponseReplaceRules(config.GetFilterConfig().ResponseReplaceRules); len(respRules) > 0 {
+			finalContent = applyResponseReplacements(respRules, finalContent)
+		}
 		rawThinkingContent := thinkingContent
 		if thinking && rawThinkingContent == "" && extractedReasoning != "" {
 			rawThinkingContent = extractedReasoning

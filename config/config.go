@@ -142,12 +142,36 @@ type ToolDescReplaceRule struct {
 	Enabled     bool   `json:"enabled"`
 }
 
+// ResponseReplaceRule is a find/replace applied to the VISIBLE Claude response
+// text (the assistant's answer). It runs on both streaming and non-streaming
+// Claude (/v1/messages) responses; thinking traces and tool-call arguments are
+// exempt. Rules are applied in list order.
+//
+// Streaming safety: because the response is filtered as it streams, a match
+// could be split across frame boundaries. MaxLen is the operator's declared
+// upper bound (in bytes) on how long a single match of this rule can be. The
+// filter holds back that many trailing bytes at each frame so a match is never
+// split. If a rule's Match is a regex whose real matches can exceed MaxLen, a
+// long match straddling the streamed boundary may be missed — keep MaxLen a
+// true upper bound. For a literal rule (IsRegex=false) MaxLen defaults to the
+// match length when left at 0.
+type ResponseReplaceRule struct {
+	ID      string `json:"id"`
+	Name    string `json:"name,omitempty"`
+	Match   string `json:"match"`
+	Replace string `json:"replace,omitempty"`
+	IsRegex bool   `json:"isRegex,omitempty"`
+	MaxLen  int    `json:"maxLen,omitempty"`
+	Enabled bool   `json:"enabled"`
+}
+
 // FilterConfig groups all Claude-path filter settings exposed via the admin
 // "过滤" tab.
 type FilterConfig struct {
 	SystemInjection      SystemPromptInjection     `json:"systemInjection"`
 	SystemReplaceRules   []SystemPromptReplaceRule `json:"systemReplaceRules"`
 	ToolDescReplaceRules []ToolDescReplaceRule     `json:"toolDescReplaceRules"`
+	ResponseReplaceRules []ResponseReplaceRule     `json:"responseReplaceRules"`
 }
 
 // ApiKeyEntry represents a single API key with optional usage limits and counters.
@@ -839,16 +863,21 @@ func GetFilterConfig() FilterConfig {
 		return FilterConfig{
 			SystemReplaceRules:   []SystemPromptReplaceRule{},
 			ToolDescReplaceRules: []ToolDescReplaceRule{},
+			ResponseReplaceRules: []ResponseReplaceRule{},
 		}
 	}
 	out := FilterConfig{SystemInjection: cfg.Filter.SystemInjection}
 	out.SystemReplaceRules = append([]SystemPromptReplaceRule(nil), cfg.Filter.SystemReplaceRules...)
 	out.ToolDescReplaceRules = append([]ToolDescReplaceRule(nil), cfg.Filter.ToolDescReplaceRules...)
+	out.ResponseReplaceRules = append([]ResponseReplaceRule(nil), cfg.Filter.ResponseReplaceRules...)
 	if out.SystemReplaceRules == nil {
 		out.SystemReplaceRules = []SystemPromptReplaceRule{}
 	}
 	if out.ToolDescReplaceRules == nil {
 		out.ToolDescReplaceRules = []ToolDescReplaceRule{}
+	}
+	if out.ResponseReplaceRules == nil {
+		out.ResponseReplaceRules = []ResponseReplaceRule{}
 	}
 	return out
 }
@@ -863,6 +892,7 @@ func UpdateFilterConfig(fc FilterConfig) error {
 	stored := FilterConfig{SystemInjection: fc.SystemInjection}
 	stored.SystemReplaceRules = append([]SystemPromptReplaceRule(nil), fc.SystemReplaceRules...)
 	stored.ToolDescReplaceRules = append([]ToolDescReplaceRule(nil), fc.ToolDescReplaceRules...)
+	stored.ResponseReplaceRules = append([]ResponseReplaceRule(nil), fc.ResponseReplaceRules...)
 	cfg.Filter = &stored
 	return Save()
 }
