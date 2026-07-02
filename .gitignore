@@ -27,3 +27,4 @@ deploy/
 temp/
 instances/
 instances/**/*
+docs/
