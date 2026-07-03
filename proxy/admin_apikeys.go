@@ -18,6 +18,7 @@ type apiKeyView struct {
 	LastUsedAt    int64   `json:"lastUsedAt,omitempty"`
 	TokenLimit    int64   `json:"tokenLimit,omitempty"`
 	CreditLimit   float64 `json:"creditLimit,omitempty"`
+	Moderation    bool    `json:"moderation"`
 	TokensUsed    int64   `json:"tokensUsed"`
 	CreditsUsed   float64 `json:"creditsUsed"`
 	RequestsCount int64   `json:"requestsCount"`
@@ -34,6 +35,7 @@ func toApiKeyView(e config.ApiKeyEntry) apiKeyView {
 		LastUsedAt:    e.LastUsedAt,
 		TokenLimit:    e.TokenLimit,
 		CreditLimit:   e.CreditLimit,
+		Moderation:    e.Moderation,
 		TokensUsed:    e.TokensUsed,
 		CreditsUsed:   e.CreditsUsed,
 		RequestsCount: e.RequestsCount,
@@ -65,6 +67,7 @@ type apiKeyCreateRequest struct {
 	Enabled     *bool   `json:"enabled,omitempty"`
 	TokenLimit  int64   `json:"tokenLimit,omitempty"`
 	CreditLimit float64 `json:"creditLimit,omitempty"`
+	Moderation  bool    `json:"moderation,omitempty"`
 }
 
 func (h *Handler) apiCreateApiKey(w http.ResponseWriter, r *http.Request) {
@@ -91,6 +94,7 @@ func (h *Handler) apiCreateApiKey(w http.ResponseWriter, r *http.Request) {
 		Enabled:     enabled,
 		TokenLimit:  req.TokenLimit,
 		CreditLimit: req.CreditLimit,
+		Moderation:  req.Moderation,
 	})
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
@@ -113,6 +117,7 @@ type apiKeyUpdateRequest struct {
 	Enabled     *bool    `json:"enabled,omitempty"`
 	TokenLimit  *int64   `json:"tokenLimit,omitempty"`
 	CreditLimit *float64 `json:"creditLimit,omitempty"`
+	Moderation  *bool    `json:"moderation,omitempty"`
 }
 
 func (h *Handler) apiUpdateApiKey(w http.ResponseWriter, r *http.Request, id string) {
@@ -145,6 +150,9 @@ func (h *Handler) apiUpdateApiKey(w http.ResponseWriter, r *http.Request, id str
 	}
 	if req.CreditLimit != nil {
 		patch.CreditLimit = *req.CreditLimit
+	}
+	if req.Moderation != nil {
+		patch.Moderation = *req.Moderation
 	}
 
 	if err := config.UpdateApiKey(id, patch); err != nil {

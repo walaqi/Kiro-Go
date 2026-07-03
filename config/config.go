@@ -14,6 +14,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -150,6 +151,43 @@ type FilterConfig struct {
 	ToolDescReplaceRules []ToolDescReplaceRule     `json:"toolDescReplaceRules"`
 }
 
+// JudgeRule is a single intent-moderation rubric. The LLM judge is shown all
+// enabled rules (numbered) and asked to return the number(s) of any it matches,
+// or 0 for none. Criteria is the human-authored description of what to flag.
+type JudgeRule struct {
+	ID       string `json:"id"`
+	Name     string `json:"name,omitempty"`
+	Enabled  bool   `json:"enabled"`
+	Criteria string `json:"criteria"` // 判断标准/rubric
+}
+
+// ModerationConfig configures the intent-moderation + hit-forward gateway
+// (Claude /v1/messages path only). When enabled AND a request's API key has
+// Moderation=true AND the request carries the X-Origin-Model-Id header, the
+// latest user message is classified by a cheap judge model; on a hit the whole
+// request is forwarded to ForwardURL instead of going through the normal Kiro
+// flow. See docs/plans/intent-moderation-forward-gateway.md.
+type ModerationConfig struct {
+	Enabled    bool        `json:"enabled"`    // 全局总闸
+	JudgeModel string      `json:"judgeModel"` // 如 claude-haiku-4.5
+	Rules      []JudgeRule `json:"rules"`
+	ForwardURL string      `json:"forwardUrl"` // 命中转发的固定完整 URL
+	ForwardKey string      `json:"forwardKey"` // 转发专用鉴权 key(密钥,UI 脱敏)
+}
+
+// ModerationReady reports whether the moderation gateway is fully configured to
+// run. A residual/incomplete config (Enabled=true but a required field empty) is
+// treated as "not ready" and the request falls through to the normal flow
+// (fail-open) — an unconfigured gateway is not a running gateway, and must not
+// blanket-block whitelisted keys. This is orthogonal to the fail-closed applied
+// when a judge call actually fails at runtime.
+func (m ModerationConfig) ModerationReady() bool {
+	return m.Enabled &&
+		strings.TrimSpace(m.JudgeModel) != "" &&
+		strings.TrimSpace(m.ForwardURL) != "" &&
+		strings.TrimSpace(m.ForwardKey) != ""
+}
+
 // ApiKeyEntry represents a single API key with optional usage limits and counters.
 // Limits with value 0 are treated as "no limit". Counters are cumulative and never reset
 // automatically; operators can use the admin endpoint to manually reset them.
@@ -161,6 +199,12 @@ type ApiKeyEntry struct {
 	Migrated   bool   `json:"migrated,omitempty"` // True if migrated from legacy single ApiKey field
 	CreatedAt  int64  `json:"createdAt"`          // Creation timestamp (Unix seconds)
 	LastUsedAt int64  `json:"-"`                  // Persisted to state file, not config.json
+
+	// Moderation opts this key into the intent-moderation gateway (whitelist-style,
+	// default false). Only requests from a key with Moderation=true are ever
+	// classified/forwarded, and only when the global ModerationConfig is enabled
+	// and ready. See docs/plans/intent-moderation-forward-gateway.md.
+	Moderation bool `json:"moderation,omitempty"`
 
 	// Limits (0 = unlimited)
 	TokenLimit  int64   `json:"tokenLimit,omitempty"`
@@ -288,6 +332,10 @@ type Config struct {
 	// Filter holds Claude-path system-prompt and tool-description rewrite rules,
 	// configured from the admin "过滤" tab.
 	Filter *FilterConfig `json:"filter,omitempty"`
+
+	// Moderation holds the intent-moderation + hit-forward gateway config
+	// (Claude /v1/messages path only), configured from the admin "审核" tab.
+	Moderation *ModerationConfig `json:"moderation,omitempty"`
 
 	// Timezone is used for date-based aggregation (daily stats files, etc.).
 	// Accepts any IANA timezone name (e.g. "Asia/Shanghai", "America/New_York").
@@ -864,6 +912,77 @@ func UpdateFilterConfig(fc FilterConfig) error {
 	stored.SystemReplaceRules = append([]SystemPromptReplaceRule(nil), fc.SystemReplaceRules...)
 	stored.ToolDescReplaceRules = append([]ToolDescReplaceRule(nil), fc.ToolDescReplaceRules...)
 	cfg.Filter = &stored
+	return Save()
+}
+
+// GetModerationConfig returns a deep copy of the current moderation gateway
+// configuration.
+func GetModerationConfig() ModerationConfig {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.Moderation == nil {
+		return ModerationConfig{Rules: []JudgeRule{}}
+	}
+	out := ModerationConfig{
+		Enabled:    cfg.Moderation.Enabled,
+		JudgeModel: cfg.Moderation.JudgeModel,
+		ForwardURL: cfg.Moderation.ForwardURL,
+		ForwardKey: cfg.Moderation.ForwardKey,
+	}
+	out.Rules = append([]JudgeRule(nil), cfg.Moderation.Rules...)
+	if out.Rules == nil {
+		out.Rules = []JudgeRule{}
+	}
+	return out
+}
+
+// validateModerationConfig enforces the save-time invariant: an enabled gateway
+// must have all three required fields filled and a syntactically valid http(s)
+// ForwardURL. This keeps a residual/half-filled config from reaching disk. The
+// runtime path additionally guards via ModerationReady (defense in depth against
+// a hand-edited config.json).
+func validateModerationConfig(mc ModerationConfig) error {
+	if !mc.Enabled {
+		return nil // disabled: fields may be blank
+	}
+	if strings.TrimSpace(mc.JudgeModel) == "" {
+		return fmt.Errorf("judgeModel is required when moderation is enabled")
+	}
+	if strings.TrimSpace(mc.ForwardKey) == "" {
+		return fmt.Errorf("forwardKey is required when moderation is enabled")
+	}
+	raw := strings.TrimSpace(mc.ForwardURL)
+	if raw == "" {
+		return fmt.Errorf("forwardUrl is required when moderation is enabled")
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("forwardUrl must be a valid http(s) URL")
+	}
+	return nil
+}
+
+// UpdateModerationConfig validates and saves the moderation gateway config
+// atomically. Returns an error (surfaced as HTTP 400 by the admin API) when an
+// enabled config is missing required fields, so a half-configured gateway never
+// lands on disk.
+func UpdateModerationConfig(mc ModerationConfig) error {
+	if err := validateModerationConfig(mc); err != nil {
+		return err
+	}
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg == nil {
+		return fmt.Errorf("config not initialized")
+	}
+	stored := ModerationConfig{
+		Enabled:    mc.Enabled,
+		JudgeModel: strings.TrimSpace(mc.JudgeModel),
+		ForwardURL: strings.TrimSpace(mc.ForwardURL),
+		ForwardKey: mc.ForwardKey,
+	}
+	stored.Rules = append([]JudgeRule(nil), mc.Rules...)
+	cfg.Moderation = &stored
 	return Save()
 }
 
