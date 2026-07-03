@@ -109,6 +109,8 @@
                 data-i18n="tabs.api"></span></button>
             <button type="button" class="tab" data-tab="filter"><i class="fa-solid fa-filter tab-icon"></i><span
                 data-i18n="tabs.filter"></span></button>
+            <button type="button" class="tab" data-tab="moderation"><i class="fa-solid fa-shield-halved tab-icon"></i><span
+                data-i18n="tabs.moderation"></span></button>
             <button type="button" class="tab" data-tab="logs"><i class="fa-solid fa-list tab-icon"></i><span
                 data-i18n="tabs.logs"></span></button>
           </div>
@@ -561,6 +563,60 @@
           <button class="btn btn-primary" id="saveFilterBtn" type="button" data-i18n="filter.save"></button>
         </div>
       </div>
+
+      <!-- Moderation tab -->
+      <div id="tabModeration" class="tab-content hidden">
+        <!-- Gateway toggle + judge model -->
+        <div class="card">
+          <div class="card-header"><span class="card-title" data-i18n="moderation.gatewayTitle"></span></div>
+          <div class="form-group">
+            <small class="muted-text block mb-2" data-i18n="moderation.gatewayHint"></small>
+            <label class="flex items-center gap-2 mb-2">
+              <span class="switch"><input type="checkbox" id="moderationEnabled" /><span class="slider"></span></span>
+              <span data-i18n="moderation.enabled"></span>
+            </label>
+          </div>
+          <div class="form-group">
+            <label data-i18n="moderation.judgeModel"></label>
+            <input type="text" id="moderationJudgeModel" class="input w-full"
+              data-i18n-placeholder="moderation.judgeModelPlaceholder" />
+            <small class="muted-text" data-i18n="moderation.judgeModelHint"></small>
+          </div>
+        </div>
+
+        <!-- Judge rules -->
+        <div class="card">
+          <div class="card-header"><span class="card-title" data-i18n="moderation.rulesTitle"></span></div>
+          <div class="form-group">
+            <small class="muted-text block mb-2" data-i18n="moderation.rulesHint"></small>
+            <div id="moderationRules" class="mb-2"></div>
+            <button class="btn btn-outline btn-sm" id="addModerationRuleBtn" type="button"
+              data-i18n="moderation.addRule"></button>
+          </div>
+        </div>
+
+        <!-- Forward target -->
+        <div class="card">
+          <div class="card-header"><span class="card-title" data-i18n="moderation.forwardTitle"></span></div>
+          <div class="form-group">
+            <small class="muted-text block mb-2" data-i18n="moderation.forwardHint"></small>
+            <label data-i18n="moderation.forwardUrl"></label>
+            <input type="text" id="moderationForwardUrl" class="input w-full"
+              data-i18n-placeholder="moderation.forwardUrlPlaceholder" />
+          </div>
+          <div class="form-group">
+            <label data-i18n="moderation.forwardKey"></label>
+            <input type="password" id="moderationForwardKey" class="input w-full" autocomplete="new-password"
+              data-i18n-placeholder="moderation.forwardKeyPlaceholder" />
+            <small class="muted-text" data-i18n="moderation.forwardKeyHint"></small>
+          </div>
+        </div>
+
+        <!-- Save -->
+        <div class="flex justify-end mt-2">
+          <button class="btn btn-primary" id="saveModerationBtn" type="button" data-i18n="moderation.save"></button>
+        </div>
+      </div>
     </div>
     <footer class="app-footer" aria-label="" data-i18n-aria-label="aria.footer">
       <div class="app-footer-inner">
@@ -671,6 +727,13 @@
             <span class="switch"><input type="checkbox" id="apiKeyForm_enabled" checked /><span class="slider"></span></span>
             <span data-i18n="apiKeys.formEnabled"></span>
           </label>
+        </div>
+        <div class="form-group">
+          <label class="flex items-center gap-2">
+            <span class="switch"><input type="checkbox" id="apiKeyForm_moderation" /><span class="slider"></span></span>
+            <span data-i18n="apiKeys.formModeration"></span>
+          </label>
+          <small data-i18n="apiKeys.moderationHint"></small>
         </div>
         <div class="form-group">
           <label data-i18n="apiKeys.limitTokens"></label>

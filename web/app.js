@@ -19,6 +19,8 @@
   let filterStatus = 'all';
   let privacyModeEnabled = true;
   let filterConfig = { systemInjection: { enabled: false, position: 'prepend', text: '' }, systemReplaceRules: [], toolDescReplaceRules: [] };
+  let moderationConfig = { enabled: false, judgeModel: '', rules: [], forwardUrl: '', forwardKeyMasked: '', forwardKeySet: false };
+  let moderationForwardKeyDirty = false;
   let builderIdSession = '';
   let builderIdPollTimer = null;
   let iamSession = '';
@@ -1582,7 +1584,7 @@
     const d = await res.json();
     $('requireApiKey').checked = d.requireApiKey;
     $('allowOverUsage').checked = d.allowOverUsage || false;
-    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadFilterConfig(), loadApiKeys(), loadCostConfig()]);
+    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadFilterConfig(), loadModerationConfig(), loadApiKeys(), loadCostConfig()]);
     refreshCustomSelects();
   }
   async function loadThinkingConfig() {
@@ -1845,6 +1847,7 @@
       keyEl.readOnly = false;
     }
     $('apiKeyForm_enabled').checked = entry ? !!entry.enabled : true;
+    $('apiKeyForm_moderation').checked = entry ? !!entry.moderation : false;
     $('apiKeyForm_tokenLimit').value = entry ? String(entry.tokenLimit || 0) : '0';
     $('apiKeyForm_creditLimit').value = entry ? String(entry.creditLimit || 0) : '0';
     apiKeyModalSubmitting = false;
@@ -1867,11 +1870,13 @@
     try {
       const name = $('apiKeyForm_name').value.trim();
       const enabled = $('apiKeyForm_enabled').checked;
+      const moderation = $('apiKeyForm_moderation').checked;
       const tokenLimit = parseInt($('apiKeyForm_tokenLimit').value, 10);
       const creditLimit = parseFloat($('apiKeyForm_creditLimit').value);
       const payload = {
         name: name,
         enabled: enabled,
+        moderation: moderation,
         tokenLimit: isNaN(tokenLimit) || tokenLimit < 0 ? 0 : tokenLimit,
         creditLimit: isNaN(creditLimit) || creditLimit < 0 ? 0 : creditLimit
       };
@@ -2094,6 +2099,84 @@
   function addToolDescReplaceRule() {
     filterConfig.toolDescReplaceRules.push({ id: 'td-' + Date.now(), toolName: '', description: '', enabled: true });
     renderToolDescReplaceRules();
+  }
+
+  // ---- Moderation gateway tab ----
+  async function loadModerationConfig() {
+    const res = await api('/moderation');
+    const d = await res.json();
+    moderationConfig = {
+      enabled: !!d.enabled,
+      judgeModel: d.judgeModel || '',
+      rules: Array.isArray(d.rules) ? d.rules : [],
+      forwardUrl: d.forwardUrl || '',
+      forwardKeyMasked: d.forwardKeyMasked || '',
+      forwardKeySet: !!d.forwardKeySet
+    };
+    moderationForwardKeyDirty = false;
+    renderModerationTab();
+  }
+  async function saveModerationConfig() {
+    moderationConfig.enabled = $('moderationEnabled').checked;
+    moderationConfig.judgeModel = $('moderationJudgeModel').value.trim();
+    moderationConfig.forwardUrl = $('moderationForwardUrl').value.trim();
+    const payload = {
+      enabled: moderationConfig.enabled,
+      judgeModel: moderationConfig.judgeModel,
+      rules: moderationConfig.rules,
+      forwardUrl: moderationConfig.forwardUrl
+    };
+    // Only send forwardKey when the operator actually typed a new one. Otherwise
+    // the stored secret is preserved server-side (the UI never holds cleartext).
+    if (moderationForwardKeyDirty) {
+      payload.forwardKey = $('moderationForwardKey').value;
+    }
+    const res = await api('/moderation', { method: 'POST', body: JSON.stringify(payload) });
+    const d = await res.json().catch(() => ({}));
+    if (res.ok && d.success) {
+      toast(t('moderation.saved'), 'success');
+      await loadModerationConfig();
+    } else {
+      toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
+    }
+  }
+  function renderModerationTab() {
+    $('moderationEnabled').checked = !!moderationConfig.enabled;
+    $('moderationJudgeModel').value = moderationConfig.judgeModel || '';
+    $('moderationForwardUrl').value = moderationConfig.forwardUrl || '';
+    const keyEl = $('moderationForwardKey');
+    // Show a masked placeholder when a key exists; leave the field blank so an
+    // empty submit means "keep existing".
+    keyEl.value = '';
+    keyEl.placeholder = moderationConfig.forwardKeySet
+      ? (moderationConfig.forwardKeyMasked || '••••••')
+      : t('moderation.forwardKeyPlaceholder');
+    moderationForwardKeyDirty = false;
+    renderModerationRules();
+  }
+  function renderModerationRules() {
+    const c = $('moderationRules');
+    if (!c) return;
+    const rules = moderationConfig.rules;
+    if (!rules.length) {
+      c.innerHTML = '<small class="text-xs muted-text">' + escapeHtml(t('moderation.noRules')) + '</small>';
+      return;
+    }
+    c.innerHTML = rules.map((r, i) =>
+      '<div class="rule-card' + (r.enabled ? '' : ' disabled') + '">' +
+      '<div class="rule-header">' +
+      '<label class="switch"><input type="checkbox" ' + (r.enabled ? 'checked' : '') + ' data-mr-toggle="' + i + '" /><span class="slider"></span></label>' +
+      '<div class="rule-meta"><input class="rule-name-input" value="' + escapeAttr(r.name || '') + '" data-mr-idx="' + i + '" data-mr-field="name" placeholder="' + escapeAttr(t('moderation.ruleNamePlaceholder')) + '" /></div>' +
+      '<button class="rule-remove" data-mr-remove="' + i + '" type="button" aria-label="' + escapeAttr(t('common.remove')) + '">&times;</button>' +
+      '</div>' +
+      '<div class="rule-body">' +
+      '<div class="rule-field"><label>' + escapeHtml(t('moderation.ruleCriteria')) + '</label><textarea rows="2" data-mr-idx="' + i + '" data-mr-field="criteria" placeholder="' + escapeAttr(t('moderation.ruleCriteriaPlaceholder')) + '">' + escapeHtml(r.criteria || '') + '</textarea></div>' +
+      '</div></div>'
+    ).join('');
+  }
+  function addModerationRule() {
+    moderationConfig.rules.push({ id: 'mr-' + Date.now(), name: '', criteria: '', enabled: true });
+    renderModerationRules();
   }
 
   // Add-account modal templates
@@ -2935,6 +3018,32 @@
     $('toolDescReplaceRules').addEventListener('click', e => {
       const rm = e.target.closest('[data-td-remove]');
       if (rm) { filterConfig.toolDescReplaceRules.splice(parseInt(rm.dataset.tdRemove, 10), 1); renderToolDescReplaceRules(); }
+    });
+
+    bindModerationEvents();
+  }
+
+  function bindModerationEvents() {
+    $('saveModerationBtn').addEventListener('click', saveModerationConfig);
+    $('addModerationRuleBtn').addEventListener('click', addModerationRule);
+    // Mark the forward key dirty on any edit so an untouched field preserves the
+    // stored secret on save.
+    $('moderationForwardKey').addEventListener('input', () => { moderationForwardKeyDirty = true; });
+
+    $('moderationRules').addEventListener('input', e => {
+      const idx = e.target.dataset.mrIdx;
+      const field = e.target.dataset.mrField;
+      if (idx != null && field) moderationConfig.rules[idx][field] = e.target.value;
+    });
+    $('moderationRules').addEventListener('change', e => {
+      if (e.target.dataset.mrToggle != null) {
+        moderationConfig.rules[e.target.dataset.mrToggle].enabled = e.target.checked;
+        renderModerationRules();
+      }
+    });
+    $('moderationRules').addEventListener('click', e => {
+      const rm = e.target.closest('[data-mr-remove]');
+      if (rm) { moderationConfig.rules.splice(parseInt(rm.dataset.mrRemove, 10), 1); renderModerationRules(); }
     });
   }
 

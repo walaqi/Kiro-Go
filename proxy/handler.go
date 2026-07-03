@@ -60,6 +60,12 @@ type Handler struct {
 	requestLogs   []RequestLog
 	errorLogs     []RequestLog
 	requestLogsMu sync.RWMutex
+
+	// judgeCallOverride, when non-nil, replaces the Kiro-pool-backed judge caller
+	// used by the moderation gateway. Test-only seam: lets interception tests
+	// inject a deterministic verdict (and count calls) without a live account
+	// pool. Nil in production, where kiroJudgeCall is used.
+	judgeCallOverride judgeCaller
 }
 
 type thinkingStreamSource int
@@ -824,6 +830,13 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	}
 	if msg := validateClaudeRequestShape(&req); msg != "" {
 		h.sendClaudeError(w, 400, "invalid_request_error", msg)
+		return
+	}
+
+	// Intent-moderation gateway (§3). Runs before any thinking/cacheProfile/
+	// ClaudeToKiro work so a hit-forward request never wastes that computation.
+	// When it handles the request (forwarded or failed-closed), we return here.
+	if h.maybeModerate(w, r, &req, body) {
 		return
 	}
 
@@ -2371,6 +2384,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetFilter(w, r)
 	case path == "/filter" && r.Method == "POST":
 		h.apiUpdateFilter(w, r)
+	case path == "/moderation" && r.Method == "GET":
+		h.apiGetModeration(w, r)
+	case path == "/moderation" && r.Method == "POST":
+		h.apiUpdateModeration(w, r)
 	case path == "/version" && r.Method == "GET":
 		h.apiGetVersion(w, r)
 	case path == "/export" && r.Method == "POST":
