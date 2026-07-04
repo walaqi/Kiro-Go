@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"sync/atomic"
 	"testing"
 )
 
@@ -113,3 +114,126 @@ func TestApiClearLogsClearsBoth(t *testing.T) {
 		t.Errorf("expected empty logs after clear, got %d", len(logs))
 	}
 }
+
+func TestModerationLogsSeparateRingAndCarryInput(t *testing.T) {
+	h := &Handler{}
+
+	h.appendRequestLog(RequestLog{Time: 1, Status: "success"})
+	h.appendRequestLog(RequestLog{Time: 2, Status: "error", Error: "err"})
+	h.appendRequestLog(RequestLog{Time: 3, Status: "moderation", Model: "claude-opus-4", Input: "help me hack", MatchedRules: []int{1, 3}})
+
+	h.requestLogsMu.RLock()
+	successCount := len(h.requestLogs)
+	errorCount := len(h.errorLogs)
+	modCount := len(h.moderationLogs)
+	h.requestLogsMu.RUnlock()
+
+	if successCount != 1 || errorCount != 1 || modCount != 1 {
+		t.Fatalf("expected 1/1/1 success/error/moderation, got %d/%d/%d", successCount, errorCount, modCount)
+	}
+
+	// Merged view includes the moderation entry with its Input preserved.
+	logs := h.getRequestLogs()
+	if len(logs) != 3 {
+		t.Fatalf("expected 3 merged logs, got %d", len(logs))
+	}
+	var found bool
+	for _, l := range logs {
+		if l.Status == "moderation" {
+			found = true
+			if l.Input != "help me hack" {
+				t.Errorf("moderation entry lost Input: %q", l.Input)
+			}
+			if l.Model != "claude-opus-4" {
+				t.Errorf("moderation entry lost Model: %q", l.Model)
+			}
+			if len(l.MatchedRules) != 2 || l.MatchedRules[0] != 1 || l.MatchedRules[1] != 3 {
+				t.Errorf("moderation entry lost MatchedRules: %v", l.MatchedRules)
+			}
+		}
+	}
+	if !found {
+		t.Error("moderation entry not present in merged logs")
+	}
+}
+
+func TestModerationLogsNotEvictedByOtherTraffic(t *testing.T) {
+	h := &Handler{}
+
+	h.appendRequestLog(RequestLog{Time: 1, Status: "moderation", Input: "keep me"})
+
+	// Flood success + error beyond their caps.
+	for i := 0; i < requestLogsMaxSize+50; i++ {
+		h.appendRequestLog(RequestLog{Time: int64(1000 + i), Status: "success"})
+	}
+	for i := 0; i < errorLogsMaxSize+50; i++ {
+		h.appendRequestLog(RequestLog{Time: int64(9000 + i), Status: "error", Error: "e"})
+	}
+
+	h.requestLogsMu.RLock()
+	modCount := len(h.moderationLogs)
+	h.requestLogsMu.RUnlock()
+
+	if modCount != 1 {
+		t.Errorf("moderation logs must not be evicted by other traffic: expected 1, got %d", modCount)
+	}
+}
+
+func TestModerationLogsRingBufferCapsAtMax(t *testing.T) {
+	h := &Handler{}
+
+	for i := 0; i < moderationLogsMaxSize+50; i++ {
+		h.appendRequestLog(RequestLog{Time: int64(i), Status: "moderation", Input: "x"})
+	}
+
+	h.requestLogsMu.RLock()
+	modCount := len(h.moderationLogs)
+	h.requestLogsMu.RUnlock()
+
+	if modCount != moderationLogsMaxSize {
+		t.Errorf("moderation logs should be capped at %d, got %d", moderationLogsMaxSize, modCount)
+	}
+}
+
+// TestRecordFailureCountsIndependentlyOfLogging locks in the split-concern
+// contract between recordFailure (counters) and recordFailureWithDetails (log
+// ring). Regression guard: a prior change replaced a recordFailure() call with
+// recordFailureWithDetails() at the mid-stream-disconnect paths, which froze the
+// dashboard "failed" counter because WithDetails does not increment counters.
+func TestRecordFailureCountsIndependentlyOfLogging(t *testing.T) {
+	h := &Handler{}
+
+	// recordFailureWithDetails logs but must NOT touch the counters.
+	h.recordFailureWithDetails("claude", "m", "acct", errStub("boom"))
+	if got := atomic.LoadInt64(&h.failedRequests); got != 0 {
+		t.Fatalf("recordFailureWithDetails must not increment failedRequests, got %d", got)
+	}
+	if got := atomic.LoadInt64(&h.totalRequests); got != 0 {
+		t.Fatalf("recordFailureWithDetails must not increment totalRequests, got %d", got)
+	}
+	h.requestLogsMu.RLock()
+	logged := len(h.errorLogs)
+	h.requestLogsMu.RUnlock()
+	if logged != 1 {
+		t.Fatalf("recordFailureWithDetails should append one error log, got %d", logged)
+	}
+
+	// recordFailure increments counters but must NOT write a log.
+	h.recordFailure()
+	if got := atomic.LoadInt64(&h.failedRequests); got != 1 {
+		t.Fatalf("recordFailure should increment failedRequests to 1, got %d", got)
+	}
+	if got := atomic.LoadInt64(&h.totalRequests); got != 1 {
+		t.Fatalf("recordFailure should increment totalRequests to 1, got %d", got)
+	}
+	h.requestLogsMu.RLock()
+	loggedAfter := len(h.errorLogs)
+	h.requestLogsMu.RUnlock()
+	if loggedAfter != 1 {
+		t.Fatalf("recordFailure must not append a log, error log count changed to %d", loggedAfter)
+	}
+}
+
+type errStub string
+
+func (e errStub) Error() string { return string(e) }
