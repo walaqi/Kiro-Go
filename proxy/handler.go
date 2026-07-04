@@ -20,22 +20,26 @@ import (
 
 const tokenRefreshSkewSeconds int64 = 120
 
-// RequestLog stores details about a single API request (success or failure).
+// RequestLog stores details about a single API request (success, error, or a
+// moderation-gateway hit that was forwarded).
 type RequestLog struct {
-	Time      int64  `json:"time"`      // Unix timestamp
-	Endpoint  string `json:"endpoint"`  // claude/openai/responses
-	Model     string `json:"model"`     // Requested model
-	AccountID string `json:"accountId"` // Account used
-	Status    string `json:"status"`    // "success" or "error"
-	Error     string `json:"error"`     // Error message (empty on success)
-	ErrorType string `json:"errorType"` // Error category (empty on success)
-	Tokens    int    `json:"tokens"`    // Total tokens (input+output, 0 on failure)
-	Credits   float64 `json:"credits"`  // Credits consumed (0 on failure)
-	Duration  int64  `json:"duration"`  // Request duration in ms
+	Time         int64   `json:"time"`                   // Unix timestamp
+	Endpoint     string  `json:"endpoint"`               // claude/openai/responses
+	Model        string  `json:"model"`                  // Requested model (or forward-as model for moderation entries)
+	AccountID    string  `json:"accountId"`              // Account used
+	Status       string  `json:"status"`                 // "success", "error", or "moderation"
+	Error        string  `json:"error"`                  // Error message (empty on success)
+	ErrorType    string  `json:"errorType"`              // Error category (empty on success)
+	Tokens       int     `json:"tokens"`                 // Total tokens (input+output, 0 on failure)
+	Credits      float64 `json:"credits"`                // Credits consumed (0 on failure)
+	Duration     int64   `json:"duration"`               // Request duration in ms
+	Input        string  `json:"input,omitempty"`        // Forwarded user message (moderation entries only)
+	MatchedRules []int   `json:"matchedRules,omitempty"` // Judge-matched rule numbers (moderation entries only)
 }
 
 const requestLogsMaxSize = 500
 const errorLogsMaxSize = 500
+const moderationLogsMaxSize = 500
 
 // Handler HTTP 处理器
 type Handler struct {
@@ -56,10 +60,11 @@ type Handler struct {
 	modelsCacheTime int64
 	promptCache     *promptCacheTracker
 	tokenRefreshMu  sync.Mutex
-	// 请求日志 (环形缓冲区，成功和错误分开存储)
-	requestLogs   []RequestLog
-	errorLogs     []RequestLog
-	requestLogsMu sync.RWMutex
+	// 请求日志 (环形缓冲区，成功/错误/审核转发分开存储)
+	requestLogs    []RequestLog
+	errorLogs      []RequestLog
+	moderationLogs []RequestLog
+	requestLogsMu  sync.RWMutex
 
 	// judgeCallOverride, when non-nil, replaces the Kiro-pool-backed judge caller
 	// used by the moderation gateway. Test-only seam: lets interception tests
@@ -1249,6 +1254,12 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			if !messageStarted {
 				continue
 			}
+			// Mid-stream upstream disconnect after streaming began: count it AND log
+			// it. recordFailure increments the global counters; recordFailureWithDetails
+			// only appends to the log ring. These are separate concerns — a prior
+			// change replaced the counter call with the log call here, which silently
+			// stopped counting the most common failure mode (mid-stream disconnect).
+			h.recordFailure()
 			h.recordFailureWithDetails("claude", model, account.ID, err)
 			h.sendSSE(w, flusher, "error", map[string]interface{}{
 				"type":  "error",
@@ -1398,13 +1409,23 @@ func (h *Handler) recordSuccessForApiKey(apiKeyID, accountID string, inputTokens
 	}
 }
 
-// recordFailureWithDetails records a failure and stores it in the request logs.
-// recordFailure increments the global request/failure counters.
+// recordFailure increments the global request/failure counters (the numbers
+// shown on the dashboard "失败" card). It does NOT write to the request-log ring.
+//
+// IMPORTANT: recordFailure and recordFailureWithDetails are SEPARATE concerns —
+// counting vs. logging. A failure path that should be both counted and logged
+// must call BOTH. Do not "upgrade" a recordFailure() call to
+// recordFailureWithDetails() thinking it is a superset: it is not, and doing so
+// silently stops counting that path (this exact mistake once froze the failed
+// counter for all mid-stream disconnects).
 func (h *Handler) recordFailure() {
 	atomic.AddInt64(&h.totalRequests, 1)
 	atomic.AddInt64(&h.failedRequests, 1)
 }
 
+// recordFailureWithDetails appends a failure entry to the request-log ring (for
+// the Logs panel). It does NOT touch the global counters — pair it with
+// recordFailure() when the failure should also count. See recordFailure.
 func (h *Handler) recordFailureWithDetails(endpoint, model, accountID string, err error) {
 	if err == nil {
 		return
@@ -1444,7 +1465,8 @@ func (h *Handler) recordSuccessLog(endpoint, model, accountID string, tokens int
 
 func (h *Handler) appendRequestLog(entry RequestLog) {
 	h.requestLogsMu.Lock()
-	if entry.Status == "error" {
+	switch entry.Status {
+	case "error":
 		if h.errorLogs == nil {
 			h.errorLogs = make([]RequestLog, 0, errorLogsMaxSize)
 		}
@@ -1452,7 +1474,15 @@ func (h *Handler) appendRequestLog(entry RequestLog) {
 			h.errorLogs = h.errorLogs[1:]
 		}
 		h.errorLogs = append(h.errorLogs, entry)
-	} else {
+	case "moderation":
+		if h.moderationLogs == nil {
+			h.moderationLogs = make([]RequestLog, 0, moderationLogsMaxSize)
+		}
+		if len(h.moderationLogs) >= moderationLogsMaxSize {
+			h.moderationLogs = h.moderationLogs[1:]
+		}
+		h.moderationLogs = append(h.moderationLogs, entry)
+	default:
 		if h.requestLogs == nil {
 			h.requestLogs = make([]RequestLog, 0, requestLogsMaxSize)
 		}
@@ -1486,13 +1516,14 @@ func classifyError(msg string) string {
 func (h *Handler) getRequestLogs() []RequestLog {
 	h.requestLogsMu.RLock()
 	defer h.requestLogsMu.RUnlock()
-	total := len(h.requestLogs) + len(h.errorLogs)
+	total := len(h.requestLogs) + len(h.errorLogs) + len(h.moderationLogs)
 	if total == 0 {
 		return []RequestLog{}
 	}
 	merged := make([]RequestLog, 0, total)
 	merged = append(merged, h.requestLogs...)
 	merged = append(merged, h.errorLogs...)
+	merged = append(merged, h.moderationLogs...)
 	// 按时间降序排列（newest first）
 	sort.Slice(merged, func(i, j int) bool {
 		return merged[i].Time > merged[j].Time
@@ -2055,6 +2086,9 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			if !responseStarted {
 				continue
 			}
+			// Mid-stream upstream disconnect: count it AND log it (see the Claude
+			// stream path for why both calls are needed).
+			h.recordFailure()
 			h.recordFailureWithDetails("openai", model, account.ID, err)
 			return
 		}
@@ -3277,6 +3311,7 @@ func (h *Handler) apiClearLogs(w http.ResponseWriter, r *http.Request) {
 	h.requestLogsMu.Lock()
 	h.requestLogs = h.requestLogs[:0]
 	h.errorLogs = h.errorLogs[:0]
+	h.moderationLogs = h.moderationLogs[:0]
 	h.requestLogsMu.Unlock()
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }

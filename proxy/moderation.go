@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"kiro-go/config"
 	"kiro-go/logger"
@@ -271,6 +272,18 @@ func (h *Handler) maybeModerate(w http.ResponseWriter, r *http.Request, req *Cla
 	}
 
 	logger.Infof("moderation: hit (rules=%v), forwarding to configured target", matched)
+	// Record the forwarded request in the "moderation" log ring so operators can
+	// review hit content in the admin panel (Logs → 仅审核), independent of the
+	// debug-gated stdout logs. Input holds the exact user message that was
+	// forwarded (latest user turn); Model is the origin model it was forwarded as.
+	h.appendRequestLog(RequestLog{
+		Time:         time.Now().Unix(),
+		Endpoint:     "claude",
+		Model:        originModel,
+		Status:       "moderation",
+		Input:        userText,
+		MatchedRules: matched,
+	})
 	h.forwardModeratedRequest(w, r, rawBody, originModel, mc)
 	return true
 }

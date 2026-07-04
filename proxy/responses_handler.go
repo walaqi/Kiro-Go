@@ -486,6 +486,9 @@ func (h *Handler) handleResponsesStream(
 					},
 				},
 			})
+			// Mid-stream upstream disconnect: count it AND log it (see the Claude
+			// stream path for why both calls are needed).
+			h.recordFailure()
 			h.recordFailureWithDetails("responses", model, account.ID, err)
 			return
 		}

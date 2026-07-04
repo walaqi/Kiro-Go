@@ -774,11 +774,13 @@
 
     const total = logs.length;
     const okCount = logs.filter(l => l.status === 'success').length;
-    const errCount = total - okCount;
+    const modCount = logs.filter(l => l.status === 'moderation').length;
+    const errCount = total - okCount - modCount;
     summary.innerHTML =
       '<span>' + escapeHtml(t('logs.total')) + ': <strong>' + total + '</strong></span>' +
       '<span>' + escapeHtml(t('logs.success')) + ': <strong>' + okCount + '</strong></span>' +
-      '<span>' + escapeHtml(t('logs.errors')) + ': <strong>' + errCount + '</strong></span>';
+      '<span>' + escapeHtml(t('logs.errors')) + ': <strong>' + errCount + '</strong></span>' +
+      '<span>' + escapeHtml(t('logs.moderation')) + ': <strong>' + modCount + '</strong></span>';
 
     const filtered = logs.filter(l => logsFilter === 'all' || l.status === logsFilter);
 
@@ -799,13 +801,26 @@
       '</tr></thead><tbody>';
     for (const l of filtered) {
       const isErr = l.status === 'error';
+      const isMod = l.status === 'moderation';
+      let statusLabel;
+      if (isErr) statusLabel = t('logs.statusError');
+      else if (isMod) statusLabel = t('logs.statusModeration');
+      else statusLabel = t('logs.statusSuccess');
       const statusCell = '<span class="log-status log-status--' + escapeAttr(l.status) + '">' +
-        escapeHtml(isErr ? t('logs.statusError') : t('logs.statusSuccess')) + '</span>';
+        escapeHtml(statusLabel) + '</span>';
       let detailCell;
       if (isErr) {
         detailCell = '<span class="err-badge err-badge--' + escapeAttr(l.errorType || 'unknown') + '">' +
           escapeHtml(errorTypeLabel(l.errorType || 'unknown')) + '</span> ' +
           '<span class="log-msg" title="' + escapeAttr(l.error) + '">' + escapeHtml(l.error) + '</span>';
+      } else if (isMod) {
+        // Show the matched rule numbers + the forwarded user message (full text on hover).
+        const rules = Array.isArray(l.matchedRules) ? l.matchedRules : [];
+        const rulesBadge = rules.length
+          ? '<span class="err-badge err-badge--moderation" title="' + escapeAttr(t('logs.matchedRules')) + '">#' + escapeHtml(rules.join(',')) + '</span> '
+          : '';
+        const input = l.input || '';
+        detailCell = rulesBadge + '<span class="log-msg" title="' + escapeAttr(input) + '">' + escapeHtml(input) + '</span>';
       } else {
         detailCell = '<span class="text-muted">' + (l.credits ? (l.credits.toFixed(3) + ' cr') : '-') + '</span>';
       }
