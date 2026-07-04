@@ -71,6 +71,56 @@ func TestRecordDailyCreditsAccumulates(t *testing.T) {
 	}
 }
 
+func TestRecordDailyModerationCredits(t *testing.T) {
+	initDailyTest(t)
+
+	// One normal request, then two moderation judge calls.
+	RecordDailyCredits("acc1", "key1", 100, 2.0)
+	RecordDailyModerationCredits("acc1", 0.3)
+	RecordDailyModerationCredits("acc2", 0.5)
+
+	today := todayDateString()
+	ds := GetDailyStats(today)
+	if ds == nil {
+		t.Fatal("expected non-nil stats for today")
+	}
+
+	// Moderation credits are included in TotalCredits (2.0 + 0.3 + 0.5).
+	if ds.TotalCredits != 2.8 {
+		t.Errorf("TotalCredits = %f, want 2.8 (moderation included)", ds.TotalCredits)
+	}
+	// Isolated moderation subtotal.
+	if ds.ModerationCredits != 0.8 {
+		t.Errorf("ModerationCredits = %f, want 0.8", ds.ModerationCredits)
+	}
+	// Judge calls do NOT count as client requests/tokens.
+	if ds.TotalRequests != 1 {
+		t.Errorf("TotalRequests = %d, want 1 (judge calls excluded)", ds.TotalRequests)
+	}
+	if ds.TotalTokens != 100 {
+		t.Errorf("TotalTokens = %d, want 100 (judge calls excluded)", ds.TotalTokens)
+	}
+	// Judge credits DO count against the account (it really spent them).
+	if ds.AccountCredits["acc1"] != 2.3 {
+		t.Errorf("AccountCredits[acc1] = %f, want 2.3", ds.AccountCredits["acc1"])
+	}
+	if ds.AccountCredits["acc2"] != 0.5 {
+		t.Errorf("AccountCredits[acc2] = %f, want 0.5", ds.AccountCredits["acc2"])
+	}
+	// Judge credits are NOT attributed to any downstream API key.
+	if ds.ApiKeyCredits["key1"] != 2.0 {
+		t.Errorf("ApiKeyCredits[key1] = %f, want 2.0 (moderation excluded)", ds.ApiKeyCredits["key1"])
+	}
+
+	// Non-positive credits are a no-op.
+	RecordDailyModerationCredits("acc1", 0)
+	RecordDailyModerationCredits("acc1", -1)
+	ds = GetDailyStats(today)
+	if ds.ModerationCredits != 0.8 {
+		t.Errorf("ModerationCredits changed by non-positive input: %f", ds.ModerationCredits)
+	}
+}
+
 func TestRecordDailyCreditsEmptyIDs(t *testing.T) {
 	initDailyTest(t)
 

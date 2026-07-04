@@ -22,6 +22,7 @@
   "stats.dailyCredits": "当日 Credits",
   "stats.dailyRequests": "当日请求",
   "stats.dailyTokens": "当日 Tokens",
+  "stats.dailyModeration": "当日审核",
   "stats.dailyApply": "应用",
   "stats.capacity": "容量",
   "stats.traffic": "流量",
