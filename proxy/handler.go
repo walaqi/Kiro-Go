@@ -3291,10 +3291,11 @@ func (h *Handler) apiGetDailyStats(w http.ResponseWriter, r *http.Request) {
 	ds := config.GetDailyStats(date)
 	if ds == nil {
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"date":          date,
-			"totalCredits":  0,
-			"totalRequests": 0,
-			"totalTokens":   0,
+			"date":              date,
+			"totalCredits":      0,
+			"totalRequests":     0,
+			"totalTokens":       0,
+			"moderationCredits": 0,
 		})
 		return
 	}

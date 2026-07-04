@@ -699,10 +699,12 @@
       $('dailyCredits').textContent = (d.totalCredits || 0).toFixed(2);
       $('dailyRequests').textContent = d.totalRequests || 0;
       $('dailyTokens').textContent = formatNum(d.totalTokens || 0);
+      $('dailyModeration').textContent = (d.moderationCredits || 0).toFixed(2);
     } catch (e) {
       $('dailyCredits').textContent = '0';
       $('dailyRequests').textContent = '0';
       $('dailyTokens').textContent = '0';
+      $('dailyModeration').textContent = '0';
     }
   }
 

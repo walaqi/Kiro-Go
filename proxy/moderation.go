@@ -177,12 +177,13 @@ func (h *Handler) kiroJudgeCall(model, prompt string) (string, error) {
 
 		var content string
 		var callErr error
+		var judgeCredits float64
 		callback := &KiroStreamCallback{
 			OnText:         func(text string, isThinking bool) { content += text },
 			OnToolUse:      func(tu KiroToolUse) {},
 			OnComplete:     func(inTok, outTok int) {},
 			OnError:        func(err error) { callErr = err },
-			OnCredits:      func(c float64) {},
+			OnCredits:      func(c float64) { judgeCredits = c },
 			OnContextUsage: func(pct float64) {},
 		}
 
@@ -197,6 +198,14 @@ func (h *Handler) kiroJudgeCall(model, prompt string) (string, error) {
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, callErr)
 			continue
+		}
+		// Track the judge call's credit cost against the day's moderation total.
+		// The judge is not metered as a client request (no usage/output billing),
+		// but it does spend the account's upstream credits, so surface that cost
+		// separately for accounting. Only the successful account is charged.
+		if judgeCredits > 0 {
+			h.pool.UpdateStats(account.ID, 0, judgeCredits)
+			config.RecordDailyModerationCredits(account.ID, judgeCredits)
 		}
 		return content, nil
 	}

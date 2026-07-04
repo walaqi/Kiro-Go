@@ -19,6 +19,14 @@ type DailyStats struct {
 	TotalTokens    int                `json:"totalTokens"`
 	AccountCredits map[string]float64 `json:"accountCredits,omitempty"`
 	ApiKeyCredits  map[string]float64 `json:"apiKeyCredits,omitempty"`
+
+	// ModerationCredits is the subset of TotalCredits spent on moderation-gateway
+	// judge calls (the cheap intent classifier). Tracked separately so operators
+	// can account for moderation cost; it is INCLUDED in TotalCredits, not additive
+	// to it. AccountCredits also reflects these (the judge really spends the
+	// account's credits); ApiKeyCredits does not, since a judge call is infra
+	// overhead, not the downstream key's billable usage.
+	ModerationCredits float64 `json:"moderationCredits,omitempty"`
 }
 
 var (
@@ -101,6 +109,31 @@ func RecordDailyCredits(accountID, apiKeyID string, tokens int, credits float64)
 	}
 	if apiKeyID != "" {
 		dailyStats.ApiKeyCredits[apiKeyID] += credits
+	}
+
+	persistDaily()
+}
+
+// RecordDailyModerationCredits adds a moderation judge call's cost to the current
+// day's aggregate. The judge really spends the account's credits, so this counts
+// toward TotalCredits and AccountCredits, and is additionally tracked in
+// ModerationCredits so the moderation cost can be isolated. It does NOT increment
+// TotalRequests/TotalTokens (a judge call is infra overhead, not a client request)
+// nor ApiKeyCredits (not the downstream key's billable usage). credits <= 0 is a
+// no-op.
+func RecordDailyModerationCredits(accountID string, credits float64) {
+	if credits <= 0 {
+		return
+	}
+	dailyMu.Lock()
+	defer dailyMu.Unlock()
+
+	ensureDailyLoaded()
+
+	dailyStats.TotalCredits += credits
+	dailyStats.ModerationCredits += credits
+	if accountID != "" {
+		dailyStats.AccountCredits[accountID] += credits
 	}
 
 	persistDaily()
