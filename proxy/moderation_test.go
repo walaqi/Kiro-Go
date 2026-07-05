@@ -400,6 +400,31 @@ func TestStripInjectedContext(t *testing.T) {
 			"<document>a<document>b</document>c</document>",
 			"",
 		},
+		{
+			// Hyphen-suffixed look-alike must NOT match a whitelisted tag: only the
+			// exact 7 tags are stripped. Left entirely as text.
+			"hyphen-suffixed lookalike not stripped",
+			"<document-section>keep this</document-section>",
+			"<document-section>keep this</document-section>",
+		},
+		{
+			"system-reminder hyphen lookalike not stripped",
+			"a<system-reminder-extra>b</system-reminder-extra>c",
+			"a<system-reminder-extra>b</system-reminder-extra>c",
+		},
+		{
+			// A real tag adjacent to a look-alike: only the exact one is removed.
+			"exact tag stripped, lookalike kept",
+			"<document>gone</document><document-x>stay</document-x>",
+			"<document-x>stay</document-x>",
+		},
+		{
+			// Boundary must be '>' or whitespace: self-closing-ish and attribute
+			// forms of the exact tag still match.
+			"exact tag with attribute still stripped",
+			"<file_contents lang=\"go\">code</file_contents>q",
+			"q",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

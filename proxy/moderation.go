@@ -327,16 +327,21 @@ var moderationStripTags = []string{
 
 // moderationTagTokenRe matches a single opening or closing tag token for any
 // known injected-context tag. Group 1 is "/" for a close tag (empty for open);
-// group 2 is the tag name. Attribute values may contain '>' inside quotes
-// (matched via the "…"/'…' alternatives). RE2 is linear-time, so this is
-// ReDoS-safe regardless of input. \b after the name prevents matching a longer
-// look-alike tag (e.g. <file_contents_extra>).
+// group 2 is the tag name.
+//
+// After the name the pattern requires an EXACT tag boundary — either '>'
+// immediately, or whitespace before the attribute list — so a hyphen-suffixed
+// look-alike such as <document-section> or <system-reminder-extra> does NOT
+// match a whitelisted tag (\b treated '-' as a boundary and wrongly matched
+// these). Attribute values may contain '>' inside quotes (the "…"/'…'
+// alternatives). RE2 is linear-time, so this is ReDoS-safe regardless of input.
 var moderationTagTokenRe = func() *regexp.Regexp {
 	alts := make([]string, len(moderationStripTags))
 	for i, tag := range moderationStripTags {
 		alts[i] = regexp.QuoteMeta(tag)
 	}
-	pattern := `(?is)<(/?)(` + strings.Join(alts, "|") + `)\b(?:"[^"]*"|'[^']*'|[^>])*>`
+	// <(/?)(name)(?: \s attrs )? >  — name must be followed by '>' or whitespace.
+	pattern := `(?is)<(/?)(` + strings.Join(alts, "|") + `)(?:\s(?:"[^"]*"|'[^']*'|[^>])*)?>`
 	return regexp.MustCompile(pattern)
 }()
 
