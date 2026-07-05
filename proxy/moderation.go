@@ -263,13 +263,24 @@ func (h *Handler) maybeModerate(w http.ResponseWriter, r *http.Request, req *Cla
 		return false
 	}
 
+	// Strip client-injected context tags (file contents, system reminders, etc.)
+	// before judging — their contents are ambient context, not user intent, and
+	// caused many false positives. Only the JUDGE sees the stripped text; the
+	// forwarded body and the logged Input keep the full original message. If
+	// nothing but injected context remains (no actual user-typed text), there is
+	// no intent to classify → skip judging and take the normal flow.
+	judgeText := stripInjectedContext(userText)
+	if judgeText == "" {
+		return false
+	}
+
 	// Step 4: judge.
 	call := h.kiroJudgeCall
 	if h.judgeCallOverride != nil {
 		call = h.judgeCallOverride
 	}
 	moderator := newLLMModerator(mc.JudgeModel, call)
-	hit, matched, err := moderator.Moderate(userText, mc.Rules)
+	hit, matched, err := moderator.Moderate(judgeText, mc.Rules)
 	if err != nil {
 		// fail-closed: judge unavailable → reject, client retries.
 		logger.Errorf("moderation: judge call failed, failing closed: %v", err)
@@ -295,6 +306,46 @@ func (h *Handler) maybeModerate(w http.ResponseWriter, r *http.Request, req *Cla
 	})
 	h.forwardModeratedRequest(w, r, rawBody, originModel, mc)
 	return true
+}
+
+// moderationStripTags are client-injected context wrappers (Claude Code and
+// similar) that carry ambient context — file contents, system reminders, tool
+// results, environment details — NOT the user's actual intent. Their contents
+// are removed before the text is shown to the judge: security/attack vocabulary
+// living inside injected file contents or reminders was causing large numbers of
+// false positives. This stripping affects ONLY the text handed to the judge; the
+// forwarded body and the logged Input keep the full original message.
+var moderationStripTags = []string{
+	"system-reminder",
+	"system_reminder",
+	"file_contents",
+	"document",
+	"function_results",
+	"function_calls",
+	"environment_details",
+}
+
+// moderationStripRes is one compiled regex per tag: <tag ...>...</tag>,
+// case-insensitive (?i), dot-matches-newline (?s), non-greedy. RE2 has no
+// backreferences, so we compile one regex per tag rather than a single
+// alternation closed with \1.
+var moderationStripRes = func() []*regexp.Regexp {
+	res := make([]*regexp.Regexp, 0, len(moderationStripTags))
+	for _, tag := range moderationStripTags {
+		q := regexp.QuoteMeta(tag)
+		res = append(res, regexp.MustCompile(`(?is)<`+q+`\b[^>]*>.*?</`+q+`>`))
+	}
+	return res
+}()
+
+// stripInjectedContext removes client-injected context tag blocks (see
+// moderationStripTags) from text before it is classified by the judge, then
+// trims surrounding whitespace. Returns the remaining "bare" user text.
+func stripInjectedContext(text string) string {
+	for _, re := range moderationStripRes {
+		text = re.ReplaceAllString(text, "")
+	}
+	return strings.TrimSpace(text)
 }
 
 // latestClaudeUserText finds the last message with role=="user" and extracts its

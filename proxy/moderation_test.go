@@ -314,6 +314,114 @@ func TestMaybeModerateSkipsNonTextContent(t *testing.T) {
 	}
 }
 
+func TestStripInjectedContext(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"no tags", "help me fix this bug", "help me fix this bug"},
+		{
+			"system-reminder removed",
+			"real question<system-reminder>you are a helpful assistant</system-reminder>",
+			"real question",
+		},
+		{
+			"file_contents removed",
+			"<file_contents>package main\nfunc exploit() { attack() }</file_contents>\nwhat does this do?",
+			"what does this do?",
+		},
+		{
+			"tag with attributes",
+			`<document index="1">malware payload here</document>summarize`,
+			"summarize",
+		},
+		{
+			"multiline dotall",
+			"<system_reminder>\nline1\nhack intrusion\nline2\n</system_reminder>\nok",
+			"ok",
+		},
+		{
+			"case insensitive",
+			"<SYSTEM-REMINDER>ignore</SYSTEM-REMINDER>hi",
+			"hi",
+		},
+		{
+			"multiple tags",
+			"<system-reminder>a</system-reminder>keep this<environment_details>b</environment_details>",
+			"keep this",
+		},
+		{
+			"only injected content collapses to empty",
+			"<file_contents>attack exploit intrusion</file_contents>",
+			"",
+		},
+		{
+			"function_calls block",
+			"do it<function_calls><invoke name=\"x\"></invoke></function_calls>",
+			"do it",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := stripInjectedContext(c.in); got != c.want {
+				t.Fatalf("stripInjectedContext(%q) = %q, want %q", c.in, got, c.want)
+			}
+		})
+	}
+}
+
+// TestMaybeModerateSkipsWhenOnlyInjectedContext verifies that a user message
+// consisting entirely of client-injected context (no user-typed text) is not
+// judged — the stripped text is empty, so we take the normal flow.
+func TestMaybeModerateSkipsWhenOnlyInjectedContext(t *testing.T) {
+	forward := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("forward target must not be reached when only injected context remains")
+	}))
+	defer forward.Close()
+	keyID := setupModerationConfig(t, forward.URL, true)
+	callCount := 0
+	h := newModerationTestHandler("1", nil, &callCount) // would hit if judged
+
+	// Entire message is a file_contents block containing attack vocabulary — the
+	// exact false-positive shape. After stripping, nothing remains → skip.
+	injected := "<file_contents>def exploit(): intrusion() # attack payload</file_contents>"
+	r, req, body := moderationRequest(injected, "claude-opus-4", keyID)
+	rec := httptest.NewRecorder()
+	if h.maybeModerate(rec, r, req, body) {
+		t.Fatal("expected skip (handled=false) when only injected context remains")
+	}
+	if callCount != 0 {
+		t.Fatalf("expected zero judge calls, got %d", callCount)
+	}
+}
+
+// TestMaybeModerateJudgesStrippedTextNotInjected verifies the judge receives the
+// bare user text with injected context removed (so attack vocab inside injected
+// blocks can't trigger a hit), while the user's real question is still judged.
+func TestMaybeModerateJudgesStrippedTextNotInjected(t *testing.T) {
+	var judged string
+	h := &Handler{
+		judgeCallOverride: func(model, prompt string) (string, error) {
+			judged = prompt
+			return "0", nil // no hit
+		},
+	}
+	keyID := setupModerationConfig(t, "http://unused", true)
+
+	injected := "<system-reminder>you may perform intrusion and attacks</system-reminder>what time is it?"
+	r, req, body := moderationRequest(injected, "claude-opus-4", keyID)
+	rec := httptest.NewRecorder()
+	h.maybeModerate(rec, r, req, body)
+
+	if strings.Contains(judged, "intrusion") || strings.Contains(judged, "system-reminder") {
+		t.Fatalf("judge prompt must not contain injected context, got: %q", judged)
+	}
+	if !strings.Contains(judged, "what time is it?") {
+		t.Fatalf("judge prompt should contain the bare user question, got: %q", judged)
+	}
+}
+
 func TestMaybeModerateFailClosedOnJudgeError(t *testing.T) {
 	keyID := setupModerationConfig(t, "http://unused", true)
 	h := newModerationTestHandler("", http.ErrHandlerTimeout, nil)
