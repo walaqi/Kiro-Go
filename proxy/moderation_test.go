@@ -361,6 +361,44 @@ func TestStripInjectedContext(t *testing.T) {
 			"do it<function_calls><invoke name=\"x\"></invoke></function_calls>",
 			"do it",
 		},
+		{
+			// Same-name nesting: a non-greedy regex would stop at the FIRST close
+			// and leak " more real". The stack scan removes the whole outer block.
+			"same-name nesting removed whole",
+			"<file_contents>outer <file_contents>inner attack</file_contents> more</file_contents>real",
+			"real",
+		},
+		{
+			// Unclosed opening tag: nothing after it can be safely bounded, so the
+			// whole tail is left as-is (we do not strip past a missing close).
+			"unclosed opening tag left as text",
+			"before<file_contents>unterminated attack payload",
+			"before<file_contents>unterminated attack payload",
+		},
+		{
+			// Stray close tag with no matching open is ignored (left as text).
+			"stray close tag ignored",
+			"hello</file_contents>world",
+			"hello</file_contents>world",
+		},
+		{
+			// Attribute value containing '>' must not terminate the opening tag early.
+			"attribute value with angle bracket",
+			`<document title="a > b">secret</document>keep`,
+			"keep",
+		},
+		{
+			// Interleaved different tags, both fully closed → both removed.
+			"interleaved distinct tags",
+			"a<system-reminder>x</system-reminder>b<environment_details>y</environment_details>c",
+			"abc",
+		},
+		{
+			// Deeper same-name nesting collapses entirely to empty.
+			"nested same-name collapses empty",
+			"<document>a<document>b</document>c</document>",
+			"",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

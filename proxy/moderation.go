@@ -325,27 +325,93 @@ var moderationStripTags = []string{
 	"environment_details",
 }
 
-// moderationStripRes is one compiled regex per tag: <tag ...>...</tag>,
-// case-insensitive (?i), dot-matches-newline (?s), non-greedy. RE2 has no
-// backreferences, so we compile one regex per tag rather than a single
-// alternation closed with \1.
-var moderationStripRes = func() []*regexp.Regexp {
-	res := make([]*regexp.Regexp, 0, len(moderationStripTags))
-	for _, tag := range moderationStripTags {
-		q := regexp.QuoteMeta(tag)
-		res = append(res, regexp.MustCompile(`(?is)<`+q+`\b[^>]*>.*?</`+q+`>`))
+// moderationTagTokenRe matches a single opening or closing tag token for any
+// known injected-context tag. Group 1 is "/" for a close tag (empty for open);
+// group 2 is the tag name. Attribute values may contain '>' inside quotes
+// (matched via the "…"/'…' alternatives). RE2 is linear-time, so this is
+// ReDoS-safe regardless of input. \b after the name prevents matching a longer
+// look-alike tag (e.g. <file_contents_extra>).
+var moderationTagTokenRe = func() *regexp.Regexp {
+	alts := make([]string, len(moderationStripTags))
+	for i, tag := range moderationStripTags {
+		alts[i] = regexp.QuoteMeta(tag)
 	}
-	return res
+	pattern := `(?is)<(/?)(` + strings.Join(alts, "|") + `)\b(?:"[^"]*"|'[^']*'|[^>])*>`
+	return regexp.MustCompile(pattern)
 }()
 
-// stripInjectedContext removes client-injected context tag blocks (see
-// moderationStripTags) from text before it is classified by the judge, then
-// trims surrounding whitespace. Returns the remaining "bare" user text.
+// stripInjectedContext removes client-injected context tag BLOCKS (opening tag
+// through its matching close, contents included) before the text is classified
+// by the judge, then trims whitespace.
+//
+// It uses a depth-aware stack scan rather than a single non-greedy regex, which
+// cannot handle same-name nesting: a plain <tag>.*?</tag> stops at the FIRST
+// close, leaking the remainder of a nested block to the judge. Here a block is
+// removed only when its opening tag's matching close returns the stack to empty,
+// so a nested / interleaved structure such as
+//
+//	<file_contents>outer <file_contents>inner</file_contents> more</file_contents>
+//
+// is removed whole. Unbalanced tags are left as text: an opening tag with no
+// close (nothing is stripped past it) and a stray close with no open (ignored).
+// This affects ONLY the judge's copy; the forwarded body and logged Input keep
+// the full original message.
 func stripInjectedContext(text string) string {
-	for _, re := range moderationStripRes {
-		text = re.ReplaceAllString(text, "")
+	matches := moderationTagTokenRe.FindAllStringSubmatchIndex(text, -1)
+	if len(matches) == 0 {
+		return strings.TrimSpace(text)
 	}
-	return strings.TrimSpace(text)
+
+	type frame struct {
+		tag   string
+		start int // byte offset of this opening tag token
+	}
+	type span struct{ start, end int }
+	var stack []frame
+	var removals []span
+
+	for _, m := range matches {
+		tokStart, tokEnd := m[0], m[1]
+		isClose := m[3] > m[2] // group 1 ("/?") matched a "/"
+		tag := strings.ToLower(text[m[4]:m[5]])
+
+		if !isClose {
+			stack = append(stack, frame{tag: tag, start: tokStart})
+			continue
+		}
+		// Close tag: unwind to the nearest matching open. Any unclosed inner
+		// frames above it are discarded (they were inside this block). A stray
+		// close with no matching open is ignored (left as text).
+		for i := len(stack) - 1; i >= 0; i-- {
+			if stack[i].tag == tag {
+				outerStart := stack[i].start
+				stack = stack[:i]
+				if len(stack) == 0 {
+					removals = append(removals, span{outerStart, tokEnd})
+				}
+				break
+			}
+		}
+	}
+
+	if len(removals) == 0 {
+		return strings.TrimSpace(text)
+	}
+
+	// removals are non-overlapping and in increasing order (each is recorded only
+	// when the stack empties, so the next token begins at or after its end).
+	var b strings.Builder
+	prev := 0
+	for _, s := range removals {
+		if s.start > prev {
+			b.WriteString(text[prev:s.start])
+		}
+		prev = s.end
+	}
+	if prev < len(text) {
+		b.WriteString(text[prev:])
+	}
+	return strings.TrimSpace(b.String())
 }
 
 // latestClaudeUserText finds the last message with role=="user" and extracts its
