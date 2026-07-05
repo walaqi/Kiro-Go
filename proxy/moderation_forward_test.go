@@ -159,6 +159,27 @@ func TestRewriteForwardBodyFullContentPreservesEverything(t *testing.T) {
 	}
 }
 
+// TestRewriteForwardBodyPreservesLargeIntegers is the regression guard for the
+// float64 round-trip bug: parsing the body into map[string]interface{} normalizes
+// every JSON number to float64, corrupting large integers (IDs, timestamps) in
+// metadata / custom fields. The RawMessage-based rewrite must reproduce them
+// byte-for-byte in BOTH modes. We assert on raw bytes, not decoded values, since
+// decoding here would hide the very corruption we're guarding against.
+func TestRewriteForwardBodyPreservesLargeIntegers(t *testing.T) {
+	const bigInt = "9007199254740993" // 2^53 + 1, not representable exactly as float64
+	raw := []byte(`{"model":"m","max_tokens":10,"metadata":{"request_id":` + bigInt + `},"messages":[{"role":"user","content":"hi"}]}`)
+
+	for _, fullContent := range []bool{true, false} {
+		out, err := rewriteForwardBody(raw, "origin", fullContent)
+		if err != nil {
+			t.Fatalf("fullContent=%v: rewrite: %v", fullContent, err)
+		}
+		if !strings.Contains(string(out), bigInt) {
+			t.Fatalf("fullContent=%v: large integer %s corrupted, got: %s", fullContent, bigInt, string(out))
+		}
+	}
+}
+
 // forwardTestHandler builds a handler and a ready moderation config forwarding to
 // target, plus an opted-in key. Returns the handler, key ID.
 func forwardTestHandler(t *testing.T, target string) (*Handler, string) {

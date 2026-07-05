@@ -70,28 +70,43 @@ const defaultForwardMaxTokens = 1024
 // reaches this path when that message is pure text, so no non-text content is
 // involved.
 func rewriteForwardBody(rawBody []byte, originModel string, fullContent bool) ([]byte, error) {
-	var body map[string]interface{}
+	// Parse only the top level, keeping each field's ORIGINAL JSON bytes as
+	// json.RawMessage. This avoids the interface{} round-trip that normalizes all
+	// numbers to float64 and would silently corrupt large integers (IDs,
+	// timestamps) in metadata / custom fields / tool schemas. Fields we keep are
+	// re-emitted byte-for-byte; only "model" (and a possibly-missing "max_tokens")
+	// is synthesized.
+	var body map[string]json.RawMessage
 	if err := json.Unmarshal(rawBody, &body); err != nil {
 		return nil, fmt.Errorf("forward: cannot parse request body: %w", err)
 	}
 
-	var out map[string]interface{}
+	modelRaw, err := json.Marshal(originModel)
+	if err != nil {
+		return nil, fmt.Errorf("forward: cannot encode model: %w", err)
+	}
+
+	var out map[string]json.RawMessage
 	if fullContent {
-		// Full passthrough: keep every field, swap only the model.
+		// Full passthrough: keep every field's original bytes, swap only the model.
 		out = body
-		out["model"] = originModel
+		out["model"] = modelRaw
 	} else {
-		lastUser, ok := lastUserMessageFromBody(body)
+		lastUser, ok := lastUserRawMessage(body["messages"])
 		if !ok {
 			return nil, fmt.Errorf("forward: no user message to forward")
 		}
-		out = map[string]interface{}{
-			"model":    originModel,
-			"messages": []interface{}{lastUser},
+		msgsRaw, err := json.Marshal([]json.RawMessage{lastUser})
+		if err != nil {
+			return nil, fmt.Errorf("forward: cannot encode messages: %w", err)
+		}
+		out = map[string]json.RawMessage{
+			"model":    modelRaw,
+			"messages": msgsRaw,
 		}
 		for _, k := range forwardBodyParamKeys {
 			if v, ok := body[k]; ok {
-				out[k] = v
+				out[k] = v // original bytes, verbatim
 			}
 		}
 	}
@@ -101,7 +116,11 @@ func rewriteForwardBody(rawBody []byte, originModel string, fullContent bool) ([
 	// it as-is when present, otherwise inject a conservative default so a standard
 	// Anthropic-compatible target doesn't reject the forwarded request with a 400.
 	if _, ok := out["max_tokens"]; !ok {
-		out["max_tokens"] = defaultForwardMaxTokens
+		mtRaw, err := json.Marshal(defaultForwardMaxTokens)
+		if err != nil {
+			return nil, fmt.Errorf("forward: cannot encode max_tokens: %w", err)
+		}
+		out["max_tokens"] = mtRaw
 	}
 
 	encoded, err := json.Marshal(out)
@@ -111,21 +130,28 @@ func rewriteForwardBody(rawBody []byte, originModel string, fullContent bool) ([
 	return encoded, nil
 }
 
-// lastUserMessageFromBody returns the last messages[] entry whose role=="user",
-// as the raw map from the parsed body so its content structure is preserved
-// verbatim. Returns ok=false when there is no messages array or no user message.
-func lastUserMessageFromBody(body map[string]interface{}) (map[string]interface{}, bool) {
-	raw, ok := body["messages"].([]interface{})
-	if !ok {
+// lastUserRawMessage finds the last messages[] entry whose role=="user" and
+// returns its ORIGINAL JSON bytes (so content structure — including any large
+// numbers — is preserved byte-for-byte). Only the role field is decoded, not the
+// whole message. Returns ok=false when messages is absent/not an array or has no
+// user entry.
+func lastUserRawMessage(messagesRaw json.RawMessage) (json.RawMessage, bool) {
+	if len(messagesRaw) == 0 {
 		return nil, false
 	}
-	for i := len(raw) - 1; i >= 0; i-- {
-		msg, ok := raw[i].(map[string]interface{})
-		if !ok {
+	var arr []json.RawMessage
+	if err := json.Unmarshal(messagesRaw, &arr); err != nil {
+		return nil, false
+	}
+	for i := len(arr) - 1; i >= 0; i-- {
+		var probe struct {
+			Role string `json:"role"`
+		}
+		if err := json.Unmarshal(arr[i], &probe); err != nil {
 			continue
 		}
-		if role, _ := msg["role"].(string); role == "user" {
-			return msg, true
+		if probe.Role == "user" {
+			return arr[i], true
 		}
 	}
 	return nil, false
