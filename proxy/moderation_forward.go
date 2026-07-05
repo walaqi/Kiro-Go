@@ -54,34 +54,60 @@ var forwardBodyParamKeys = []string{
 // standard-compliant forward target would 400 without it. Conservative default.
 const defaultForwardMaxTokens = 1024
 
-// rewriteForwardBody rebuilds a MINIMAL forward request body from the downstream
-// request: the origin model, a messages array containing ONLY the latest user
-// message (history / system / tools dropped), plus a whitelist of generation
-// params copied verbatim. This is the data-minimization step — the target sees
-// just the current user turn, not the whole conversation.
+// rewriteForwardBody rebuilds the forward request body from the downstream
+// request. Behavior depends on fullContent:
 //
-// The latest user message's content is preserved exactly as the downstream sent
-// it (string or text-block array); moderation only reaches the forward path when
-// that message is pure text (images / tool_result are skipped upstream), so no
-// non-text content is involved here.
-func rewriteForwardBody(rawBody []byte, originModel string) ([]byte, error) {
-	var body map[string]interface{}
+//   - false (default, data-minimized): keep only the latest user message
+//     (history / system / tools dropped) plus a whitelist of generation params.
+//     The target sees just the current user turn, minimizing conversation
+//     content that leaves the service on a hit.
+//   - true: forward the FULL original body verbatim — history, system, tools,
+//     and any custom fields all preserved — swapping ONLY the model. Controlled
+//     by the admin "forward full content" toggle (ModerationConfig.ForwardFullContent).
+//
+// Either way max_tokens is ensured (Anthropic requires it). In minimized mode the
+// latest user message's content is preserved exactly as sent; moderation only
+// reaches this path when that message is pure text, so no non-text content is
+// involved.
+func rewriteForwardBody(rawBody []byte, originModel string, fullContent bool) ([]byte, error) {
+	// Parse only the top level, keeping each field's ORIGINAL JSON bytes as
+	// json.RawMessage. This avoids the interface{} round-trip that normalizes all
+	// numbers to float64 and would silently corrupt large integers (IDs,
+	// timestamps) in metadata / custom fields / tool schemas. Fields we keep are
+	// re-emitted byte-for-byte; only "model" (and a possibly-missing "max_tokens")
+	// is synthesized.
+	var body map[string]json.RawMessage
 	if err := json.Unmarshal(rawBody, &body); err != nil {
 		return nil, fmt.Errorf("forward: cannot parse request body: %w", err)
 	}
 
-	lastUser, ok := lastUserMessageFromBody(body)
-	if !ok {
-		return nil, fmt.Errorf("forward: no user message to forward")
+	modelRaw, err := json.Marshal(originModel)
+	if err != nil {
+		return nil, fmt.Errorf("forward: cannot encode model: %w", err)
 	}
 
-	out := map[string]interface{}{
-		"model":    originModel,
-		"messages": []interface{}{lastUser},
-	}
-	for _, k := range forwardBodyParamKeys {
-		if v, ok := body[k]; ok {
-			out[k] = v
+	var out map[string]json.RawMessage
+	if fullContent {
+		// Full passthrough: keep every field's original bytes, swap only the model.
+		out = body
+		out["model"] = modelRaw
+	} else {
+		lastUser, ok := lastUserRawMessage(body["messages"])
+		if !ok {
+			return nil, fmt.Errorf("forward: no user message to forward")
+		}
+		msgsRaw, err := json.Marshal([]json.RawMessage{lastUser})
+		if err != nil {
+			return nil, fmt.Errorf("forward: cannot encode messages: %w", err)
+		}
+		out = map[string]json.RawMessage{
+			"model":    modelRaw,
+			"messages": msgsRaw,
+		}
+		for _, k := range forwardBodyParamKeys {
+			if v, ok := body[k]; ok {
+				out[k] = v // original bytes, verbatim
+			}
 		}
 	}
 
@@ -90,7 +116,11 @@ func rewriteForwardBody(rawBody []byte, originModel string) ([]byte, error) {
 	// it as-is when present, otherwise inject a conservative default so a standard
 	// Anthropic-compatible target doesn't reject the forwarded request with a 400.
 	if _, ok := out["max_tokens"]; !ok {
-		out["max_tokens"] = defaultForwardMaxTokens
+		mtRaw, err := json.Marshal(defaultForwardMaxTokens)
+		if err != nil {
+			return nil, fmt.Errorf("forward: cannot encode max_tokens: %w", err)
+		}
+		out["max_tokens"] = mtRaw
 	}
 
 	encoded, err := json.Marshal(out)
@@ -100,21 +130,28 @@ func rewriteForwardBody(rawBody []byte, originModel string) ([]byte, error) {
 	return encoded, nil
 }
 
-// lastUserMessageFromBody returns the last messages[] entry whose role=="user",
-// as the raw map from the parsed body so its content structure is preserved
-// verbatim. Returns ok=false when there is no messages array or no user message.
-func lastUserMessageFromBody(body map[string]interface{}) (map[string]interface{}, bool) {
-	raw, ok := body["messages"].([]interface{})
-	if !ok {
+// lastUserRawMessage finds the last messages[] entry whose role=="user" and
+// returns its ORIGINAL JSON bytes (so content structure — including any large
+// numbers — is preserved byte-for-byte). Only the role field is decoded, not the
+// whole message. Returns ok=false when messages is absent/not an array or has no
+// user entry.
+func lastUserRawMessage(messagesRaw json.RawMessage) (json.RawMessage, bool) {
+	if len(messagesRaw) == 0 {
 		return nil, false
 	}
-	for i := len(raw) - 1; i >= 0; i-- {
-		msg, ok := raw[i].(map[string]interface{})
-		if !ok {
+	var arr []json.RawMessage
+	if err := json.Unmarshal(messagesRaw, &arr); err != nil {
+		return nil, false
+	}
+	for i := len(arr) - 1; i >= 0; i-- {
+		var probe struct {
+			Role string `json:"role"`
+		}
+		if err := json.Unmarshal(arr[i], &probe); err != nil {
 			continue
 		}
-		if role, _ := msg["role"].(string); role == "user" {
-			return msg, true
+		if probe.Role == "user" {
+			return arr[i], true
 		}
 	}
 	return nil, false
@@ -133,7 +170,7 @@ func lastUserMessageFromBody(body map[string]interface{}) (map[string]interface{
 // disconnects, the context cancels and the forward connection is torn down,
 // preventing a long-lived SSE forward from spinning after the client is gone.
 func (h *Handler) forwardModeratedRequest(w http.ResponseWriter, r *http.Request, rawBody []byte, originModel string, mc config.ModerationConfig) {
-	newBody, err := rewriteForwardBody(rawBody, originModel)
+	newBody, err := rewriteForwardBody(rawBody, originModel, mc.ForwardFullContent)
 	if err != nil {
 		logger.Errorf("moderation forward: body rewrite failed: %v", err)
 		h.sendClaudeError(w, 400, "invalid_request_error", "Failed to prepare forwarded request")

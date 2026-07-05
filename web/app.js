@@ -19,7 +19,7 @@
   let filterStatus = 'all';
   let privacyModeEnabled = true;
   let filterConfig = { systemInjection: { enabled: false, position: 'prepend', text: '' }, systemReplaceRules: [], toolDescReplaceRules: [] };
-  let moderationConfig = { enabled: false, judgeModel: '', rules: [], forwardUrl: '', forwardKeyMasked: '', forwardKeySet: false };
+  let moderationConfig = { enabled: false, judgeModel: '', rules: [], forwardUrl: '', forwardKeyMasked: '', forwardKeySet: false, forwardFullContent: false };
   let moderationForwardKeyDirty = false;
   let builderIdSession = '';
   let builderIdPollTimer = null;
@@ -2128,7 +2128,8 @@
       rules: Array.isArray(d.rules) ? d.rules : [],
       forwardUrl: d.forwardUrl || '',
       forwardKeyMasked: d.forwardKeyMasked || '',
-      forwardKeySet: !!d.forwardKeySet
+      forwardKeySet: !!d.forwardKeySet,
+      forwardFullContent: !!d.forwardFullContent
     };
     moderationForwardKeyDirty = false;
     renderModerationTab();
@@ -2137,11 +2138,13 @@
     moderationConfig.enabled = $('moderationEnabled').checked;
     moderationConfig.judgeModel = $('moderationJudgeModel').value.trim();
     moderationConfig.forwardUrl = $('moderationForwardUrl').value.trim();
+    moderationConfig.forwardFullContent = $('moderationForwardFullContent').checked;
     const payload = {
       enabled: moderationConfig.enabled,
       judgeModel: moderationConfig.judgeModel,
       rules: moderationConfig.rules,
-      forwardUrl: moderationConfig.forwardUrl
+      forwardUrl: moderationConfig.forwardUrl,
+      forwardFullContent: moderationConfig.forwardFullContent
     };
     // Only send forwardKey when the operator actually typed a new one. Otherwise
     // the stored secret is preserved server-side (the UI never holds cleartext).
@@ -2168,6 +2171,7 @@
     keyEl.placeholder = moderationConfig.forwardKeySet
       ? (moderationConfig.forwardKeyMasked || '••••••')
       : t('moderation.forwardKeyPlaceholder');
+    $('moderationForwardFullContent').checked = !!moderationConfig.forwardFullContent;
     moderationForwardKeyDirty = false;
     renderModerationRules();
   }
