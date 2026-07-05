@@ -263,13 +263,24 @@ func (h *Handler) maybeModerate(w http.ResponseWriter, r *http.Request, req *Cla
 		return false
 	}
 
+	// Strip client-injected context tags (file contents, system reminders, etc.)
+	// before judging — their contents are ambient context, not user intent, and
+	// caused many false positives. Only the JUDGE sees the stripped text; the
+	// forwarded body and the logged Input keep the full original message. If
+	// nothing but injected context remains (no actual user-typed text), there is
+	// no intent to classify → skip judging and take the normal flow.
+	judgeText := stripInjectedContext(userText)
+	if judgeText == "" {
+		return false
+	}
+
 	// Step 4: judge.
 	call := h.kiroJudgeCall
 	if h.judgeCallOverride != nil {
 		call = h.judgeCallOverride
 	}
 	moderator := newLLMModerator(mc.JudgeModel, call)
-	hit, matched, err := moderator.Moderate(userText, mc.Rules)
+	hit, matched, err := moderator.Moderate(judgeText, mc.Rules)
 	if err != nil {
 		// fail-closed: judge unavailable → reject, client retries.
 		logger.Errorf("moderation: judge call failed, failing closed: %v", err)
@@ -295,6 +306,133 @@ func (h *Handler) maybeModerate(w http.ResponseWriter, r *http.Request, req *Cla
 	})
 	h.forwardModeratedRequest(w, r, rawBody, originModel, mc)
 	return true
+}
+
+// moderationStripTags are client-injected context wrappers (Claude Code and
+// similar) that carry ambient context — file contents, system reminders, tool
+// results, environment details — NOT the user's actual intent. Their contents
+// are removed before the text is shown to the judge: security/attack vocabulary
+// living inside injected file contents or reminders was causing large numbers of
+// false positives. This stripping affects ONLY the text handed to the judge; the
+// forwarded body and the logged Input keep the full original message.
+var moderationStripTags = []string{
+	"system-reminder",
+	"system_reminder",
+	"file_contents",
+	"document",
+	"function_results",
+	"function_calls",
+	"environment_details",
+}
+
+// moderationTagTokenRe matches a single opening or closing tag token for any
+// known injected-context tag. Group 1 is "/" for a close tag (empty for open);
+// group 2 is the tag name.
+//
+// After the name the pattern requires an EXACT tag boundary — either '>'
+// immediately, or whitespace before the attribute list — so a hyphen-suffixed
+// look-alike such as <document-section> or <system-reminder-extra> does NOT
+// match a whitelisted tag (\b treated '-' as a boundary and wrongly matched
+// these). Attribute values may contain '>' inside quotes (the "…"/'…'
+// alternatives). RE2 is linear-time, so this is ReDoS-safe regardless of input.
+var moderationTagTokenRe = func() *regexp.Regexp {
+	alts := make([]string, len(moderationStripTags))
+	for i, tag := range moderationStripTags {
+		alts[i] = regexp.QuoteMeta(tag)
+	}
+	// <(/?)(name)(?: \s attrs )? >  — name must be followed by '>' or whitespace.
+	pattern := `(?is)<(/?)(` + strings.Join(alts, "|") + `)(?:\s(?:"[^"]*"|'[^']*'|[^>])*)?>`
+	return regexp.MustCompile(pattern)
+}()
+
+// stripInjectedContext removes client-injected context tag BLOCKS (opening tag
+// through its matching close, contents included) before the text is classified
+// by the judge, then trims whitespace.
+//
+// It uses a depth-aware stack scan rather than a single non-greedy regex, which
+// cannot handle same-name nesting: a plain <tag>.*?</tag> stops at the FIRST
+// close, leaking the remainder of a nested block to the judge. Here a block is
+// removed only when its opening tag's matching close returns the stack to empty,
+// so a nested / interleaved structure such as
+//
+//	<file_contents>outer <file_contents>inner</file_contents> more</file_contents>
+//
+// is removed whole. Unbalanced tags are left as text: an opening tag with no
+// close (nothing is stripped past it) and a stray close with no open (ignored).
+// This affects ONLY the judge's copy; the forwarded body and logged Input keep
+// the full original message.
+//
+// Runs in O(n) over the token stream: a per-tag open-depth map makes a stray
+// close an O(1) skip, and each frame is pushed/popped at most once, so no input
+// (including adversarial crossed/unmatched tags) degrades to quadratic.
+func stripInjectedContext(text string) string {
+	matches := moderationTagTokenRe.FindAllStringSubmatchIndex(text, -1)
+	if len(matches) == 0 {
+		return strings.TrimSpace(text)
+	}
+
+	type frame struct {
+		tag   string
+		start int // byte offset of this opening tag token
+	}
+	type span struct{ start, end int }
+	var stack []frame
+	// depth[tag] = number of currently-open frames with that tag name. This makes
+	// a stray close tag (no matching open) an O(1) skip instead of a full stack
+	// scan, which is what keeps the whole pass linear: without it, n unmatched
+	// closes over an n-deep open stack would be O(n^2).
+	depth := make(map[string]int)
+	var removals []span
+
+	for _, m := range matches {
+		tokStart, tokEnd := m[0], m[1]
+		isClose := m[3] > m[2] // group 1 ("/?") matched a "/"
+		tag := strings.ToLower(text[m[4]:m[5]])
+
+		if !isClose {
+			stack = append(stack, frame{tag: tag, start: tokStart})
+			depth[tag]++
+			continue
+		}
+		// Stray close with no matching open anywhere in the stack → ignore in O(1).
+		if depth[tag] == 0 {
+			continue
+		}
+		// Unwind to the nearest matching open, discarding any unclosed inner frames
+		// above it (they were inside this block). depth[tag] > 0 guarantees the
+		// match exists, so the loop always breaks. Each frame is pushed once and
+		// popped once, so unwinding is amortized O(1) per token across the input.
+		for i := len(stack) - 1; i >= 0; i-- {
+			depth[stack[i].tag]--
+			if stack[i].tag == tag {
+				outerStart := stack[i].start
+				stack = stack[:i]
+				if len(stack) == 0 {
+					removals = append(removals, span{outerStart, tokEnd})
+				}
+				break
+			}
+		}
+	}
+
+	if len(removals) == 0 {
+		return strings.TrimSpace(text)
+	}
+
+	// removals are non-overlapping and in increasing order (each is recorded only
+	// when the stack empties, so the next token begins at or after its end).
+	var b strings.Builder
+	prev := 0
+	for _, s := range removals {
+		if s.start > prev {
+			b.WriteString(text[prev:s.start])
+		}
+		prev = s.end
+	}
+	if prev < len(text) {
+		b.WriteString(text[prev:])
+	}
+	return strings.TrimSpace(b.String())
 }
 
 // latestClaudeUserText finds the last message with role=="user" and extracts its

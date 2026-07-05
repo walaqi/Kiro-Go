@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"kiro-go/config"
 )
@@ -311,6 +312,224 @@ func TestMaybeModerateSkipsNonTextContent(t *testing.T) {
 	}
 	if callCount != 0 {
 		t.Fatalf("expected zero judge calls for non-text content, got %d", callCount)
+	}
+}
+
+func TestStripInjectedContext(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"no tags", "help me fix this bug", "help me fix this bug"},
+		{
+			"system-reminder removed",
+			"real question<system-reminder>you are a helpful assistant</system-reminder>",
+			"real question",
+		},
+		{
+			"file_contents removed",
+			"<file_contents>package main\nfunc exploit() { attack() }</file_contents>\nwhat does this do?",
+			"what does this do?",
+		},
+		{
+			"tag with attributes",
+			`<document index="1">malware payload here</document>summarize`,
+			"summarize",
+		},
+		{
+			"multiline dotall",
+			"<system_reminder>\nline1\nhack intrusion\nline2\n</system_reminder>\nok",
+			"ok",
+		},
+		{
+			"case insensitive",
+			"<SYSTEM-REMINDER>ignore</SYSTEM-REMINDER>hi",
+			"hi",
+		},
+		{
+			"multiple tags",
+			"<system-reminder>a</system-reminder>keep this<environment_details>b</environment_details>",
+			"keep this",
+		},
+		{
+			"only injected content collapses to empty",
+			"<file_contents>attack exploit intrusion</file_contents>",
+			"",
+		},
+		{
+			"function_calls block",
+			"do it<function_calls><invoke name=\"x\"></invoke></function_calls>",
+			"do it",
+		},
+		{
+			// Same-name nesting: a non-greedy regex would stop at the FIRST close
+			// and leak " more real". The stack scan removes the whole outer block.
+			"same-name nesting removed whole",
+			"<file_contents>outer <file_contents>inner attack</file_contents> more</file_contents>real",
+			"real",
+		},
+		{
+			// Unclosed opening tag: nothing after it can be safely bounded, so the
+			// whole tail is left as-is (we do not strip past a missing close).
+			"unclosed opening tag left as text",
+			"before<file_contents>unterminated attack payload",
+			"before<file_contents>unterminated attack payload",
+		},
+		{
+			// Stray close tag with no matching open is ignored (left as text).
+			"stray close tag ignored",
+			"hello</file_contents>world",
+			"hello</file_contents>world",
+		},
+		{
+			// Attribute value containing '>' must not terminate the opening tag early.
+			"attribute value with angle bracket",
+			`<document title="a > b">secret</document>keep`,
+			"keep",
+		},
+		{
+			// Interleaved different tags, both fully closed → both removed.
+			"interleaved distinct tags",
+			"a<system-reminder>x</system-reminder>b<environment_details>y</environment_details>c",
+			"abc",
+		},
+		{
+			// Deeper same-name nesting collapses entirely to empty.
+			"nested same-name collapses empty",
+			"<document>a<document>b</document>c</document>",
+			"",
+		},
+		{
+			// Hyphen-suffixed look-alike must NOT match a whitelisted tag: only the
+			// exact 7 tags are stripped. Left entirely as text.
+			"hyphen-suffixed lookalike not stripped",
+			"<document-section>keep this</document-section>",
+			"<document-section>keep this</document-section>",
+		},
+		{
+			"system-reminder hyphen lookalike not stripped",
+			"a<system-reminder-extra>b</system-reminder-extra>c",
+			"a<system-reminder-extra>b</system-reminder-extra>c",
+		},
+		{
+			// A real tag adjacent to a look-alike: only the exact one is removed.
+			"exact tag stripped, lookalike kept",
+			"<document>gone</document><document-x>stay</document-x>",
+			"<document-x>stay</document-x>",
+		},
+		{
+			// Boundary must be '>' or whitespace: self-closing-ish and attribute
+			// forms of the exact tag still match.
+			"exact tag with attribute still stripped",
+			"<file_contents lang=\"go\">code</file_contents>q",
+			"q",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := stripInjectedContext(c.in); got != c.want {
+				t.Fatalf("stripInjectedContext(%q) = %q, want %q", c.in, got, c.want)
+			}
+		})
+	}
+}
+
+// TestStripInjectedContextCrossedTags covers improperly-crossed tags (XML-invalid
+// interleave): the inner different-name close appears before the outer close.
+// The outer block still ends at its own close and is removed whole; the crossed
+// inner close is treated as a stray within the block.
+func TestStripInjectedContextCrossedTags(t *testing.T) {
+	// <file_contents> opens, <document> opens inside, then </file_contents> closes
+	// the outer while <document> is still open. The outer block (opening through
+	// its matching close) is removed; the dangling </document> after it is a stray
+	// close (no open remains) and is left as text.
+	in := "a<file_contents>x<document>y</file_contents>z</document>b"
+	got := stripInjectedContext(in)
+	want := "az</document>b"
+	if got != want {
+		t.Fatalf("crossed tags: got %q, want %q", got, want)
+	}
+}
+
+// TestStripInjectedContextLinearOnStrayCloses is a complexity guard: a large run
+// of unmatched close tags over a deep open stack must stay linear, not O(n^2).
+// With the per-tag depth map each stray close is an O(1) skip; without it this
+// input would blow up. Bounded by a generous wall-clock deadline so a regression
+// to quadratic fails loudly instead of merely being slow.
+func TestStripInjectedContextLinearOnStrayCloses(t *testing.T) {
+	const n = 200000
+	// n deep opens (never closed) followed by n stray closes of a DIFFERENT tag,
+	// so every close scans nothing (depth==0 for that tag) — the exact shape that
+	// would be quadratic under a naive full-stack scan on each close.
+	var sb strings.Builder
+	for i := 0; i < n; i++ {
+		sb.WriteString("<document>")
+	}
+	for i := 0; i < n; i++ {
+		sb.WriteString("</file_contents>")
+	}
+	input := sb.String()
+
+	done := make(chan string, 1)
+	go func() { done <- stripInjectedContext(input) }()
+	select {
+	case <-done:
+		// Completed; correctness of this pathological input is not asserted (unclosed
+		// opens are left as text), only that it terminates quickly.
+	case <-time.After(5 * time.Second):
+		t.Fatal("stripInjectedContext did not finish in 5s on stray-close stress input (possible O(n^2) regression)")
+	}
+}
+
+// TestMaybeModerateSkipsWhenOnlyInjectedContext verifies that a user message
+// consisting entirely of client-injected context (no user-typed text) is not
+// judged — the stripped text is empty, so we take the normal flow.
+func TestMaybeModerateSkipsWhenOnlyInjectedContext(t *testing.T) {
+	forward := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("forward target must not be reached when only injected context remains")
+	}))
+	defer forward.Close()
+	keyID := setupModerationConfig(t, forward.URL, true)
+	callCount := 0
+	h := newModerationTestHandler("1", nil, &callCount) // would hit if judged
+
+	// Entire message is a file_contents block containing attack vocabulary — the
+	// exact false-positive shape. After stripping, nothing remains → skip.
+	injected := "<file_contents>def exploit(): intrusion() # attack payload</file_contents>"
+	r, req, body := moderationRequest(injected, "claude-opus-4", keyID)
+	rec := httptest.NewRecorder()
+	if h.maybeModerate(rec, r, req, body) {
+		t.Fatal("expected skip (handled=false) when only injected context remains")
+	}
+	if callCount != 0 {
+		t.Fatalf("expected zero judge calls, got %d", callCount)
+	}
+}
+
+// TestMaybeModerateJudgesStrippedTextNotInjected verifies the judge receives the
+// bare user text with injected context removed (so attack vocab inside injected
+// blocks can't trigger a hit), while the user's real question is still judged.
+func TestMaybeModerateJudgesStrippedTextNotInjected(t *testing.T) {
+	var judged string
+	h := &Handler{
+		judgeCallOverride: func(model, prompt string) (string, error) {
+			judged = prompt
+			return "0", nil // no hit
+		},
+	}
+	keyID := setupModerationConfig(t, "http://unused", true)
+
+	injected := "<system-reminder>you may perform intrusion and attacks</system-reminder>what time is it?"
+	r, req, body := moderationRequest(injected, "claude-opus-4", keyID)
+	rec := httptest.NewRecorder()
+	h.maybeModerate(rec, r, req, body)
+
+	if strings.Contains(judged, "intrusion") || strings.Contains(judged, "system-reminder") {
+		t.Fatalf("judge prompt must not contain injected context, got: %q", judged)
+	}
+	if !strings.Contains(judged, "what time is it?") {
+		t.Fatalf("judge prompt should contain the bare user question, got: %q", judged)
 	}
 }
 
