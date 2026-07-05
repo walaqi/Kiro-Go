@@ -31,7 +31,7 @@ func TestRewriteForwardBodyMinimizesToLatestUser(t *testing.T) {
 			{"role":"user","content":"latest question"}
 		]
 	}`)
-	out, err := rewriteForwardBody(raw, "gpt-origin-model")
+	out, err := rewriteForwardBody(raw, "gpt-origin-model", false)
 	if err != nil {
 		t.Fatalf("rewrite: %v", err)
 	}
@@ -74,7 +74,7 @@ func TestRewriteForwardBodyMinimizesToLatestUser(t *testing.T) {
 
 func TestRewriteForwardBodyNoUserMessage(t *testing.T) {
 	raw := []byte(`{"model":"m","messages":[{"role":"assistant","content":"hi"}]}`)
-	if _, err := rewriteForwardBody(raw, "origin"); err == nil {
+	if _, err := rewriteForwardBody(raw, "origin", false); err == nil {
 		t.Fatal("expected error when there is no user message to forward")
 	}
 }
@@ -82,7 +82,7 @@ func TestRewriteForwardBodyNoUserMessage(t *testing.T) {
 func TestRewriteForwardBodyInjectsDefaultMaxTokens(t *testing.T) {
 	// Downstream omits max_tokens (Kiro-Go's inbound validation allows this).
 	raw := []byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`)
-	out, err := rewriteForwardBody(raw, "origin")
+	out, err := rewriteForwardBody(raw, "origin", false)
 	if err != nil {
 		t.Fatalf("rewrite: %v", err)
 	}
@@ -98,7 +98,7 @@ func TestRewriteForwardBodyInjectsDefaultMaxTokens(t *testing.T) {
 func TestRewriteForwardBodyPreservesExplicitMaxTokens(t *testing.T) {
 	// When the downstream DID send max_tokens, it must be preserved, not overridden.
 	raw := []byte(`{"model":"m","max_tokens":500,"messages":[{"role":"user","content":"hi"}]}`)
-	out, err := rewriteForwardBody(raw, "origin")
+	out, err := rewriteForwardBody(raw, "origin", false)
 	if err != nil {
 		t.Fatalf("rewrite: %v", err)
 	}
@@ -108,6 +108,54 @@ func TestRewriteForwardBodyPreservesExplicitMaxTokens(t *testing.T) {
 	}
 	if body["max_tokens"].(float64) != 500 {
 		t.Fatalf("explicit max_tokens must be preserved, got %v", body["max_tokens"])
+	}
+}
+
+func TestRewriteForwardBodyFullContentPreservesEverything(t *testing.T) {
+	// fullContent=true: history, system, tools, and custom fields must all survive;
+	// only the model is swapped.
+	raw := []byte(`{
+		"model":"claude-sonnet-4",
+		"max_tokens":100,
+		"system":"you are a helpful assistant",
+		"tools":[{"name":"calc","description":"math"}],
+		"custom_field":"keep-me",
+		"messages":[
+			{"role":"user","content":"first question"},
+			{"role":"assistant","content":"first answer"},
+			{"role":"user","content":"latest question"}
+		]
+	}`)
+	out, err := rewriteForwardBody(raw, "gpt-origin", true)
+	if err != nil {
+		t.Fatalf("rewrite: %v", err)
+	}
+	var body map[string]interface{}
+	if err := json.Unmarshal(out, &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	// model swapped
+	if body["model"] != "gpt-origin" {
+		t.Fatalf("model not swapped: %v", body["model"])
+	}
+	// full history preserved (all 3 messages)
+	msgs, ok := body["messages"].([]interface{})
+	if !ok || len(msgs) != 3 {
+		t.Fatalf("expected all 3 messages preserved, got %v", body["messages"])
+	}
+	// system / tools / custom fields all kept
+	if body["system"] != "you are a helpful assistant" {
+		t.Fatalf("system must be preserved, got %v", body["system"])
+	}
+	if _, ok := body["tools"]; !ok {
+		t.Fatalf("tools must be preserved")
+	}
+	if body["custom_field"] != "keep-me" {
+		t.Fatalf("custom_field must be preserved, got %v", body["custom_field"])
+	}
+	if body["max_tokens"].(float64) != 100 {
+		t.Fatalf("max_tokens changed: %v", body["max_tokens"])
 	}
 }
 

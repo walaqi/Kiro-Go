@@ -54,34 +54,45 @@ var forwardBodyParamKeys = []string{
 // standard-compliant forward target would 400 without it. Conservative default.
 const defaultForwardMaxTokens = 1024
 
-// rewriteForwardBody rebuilds a MINIMAL forward request body from the downstream
-// request: the origin model, a messages array containing ONLY the latest user
-// message (history / system / tools dropped), plus a whitelist of generation
-// params copied verbatim. This is the data-minimization step — the target sees
-// just the current user turn, not the whole conversation.
+// rewriteForwardBody rebuilds the forward request body from the downstream
+// request. Behavior depends on fullContent:
 //
-// The latest user message's content is preserved exactly as the downstream sent
-// it (string or text-block array); moderation only reaches the forward path when
-// that message is pure text (images / tool_result are skipped upstream), so no
-// non-text content is involved here.
-func rewriteForwardBody(rawBody []byte, originModel string) ([]byte, error) {
+//   - false (default, data-minimized): keep only the latest user message
+//     (history / system / tools dropped) plus a whitelist of generation params.
+//     The target sees just the current user turn, minimizing conversation
+//     content that leaves the service on a hit.
+//   - true: forward the FULL original body verbatim — history, system, tools,
+//     and any custom fields all preserved — swapping ONLY the model. Controlled
+//     by the admin "forward full content" toggle (ModerationConfig.ForwardFullContent).
+//
+// Either way max_tokens is ensured (Anthropic requires it). In minimized mode the
+// latest user message's content is preserved exactly as sent; moderation only
+// reaches this path when that message is pure text, so no non-text content is
+// involved.
+func rewriteForwardBody(rawBody []byte, originModel string, fullContent bool) ([]byte, error) {
 	var body map[string]interface{}
 	if err := json.Unmarshal(rawBody, &body); err != nil {
 		return nil, fmt.Errorf("forward: cannot parse request body: %w", err)
 	}
 
-	lastUser, ok := lastUserMessageFromBody(body)
-	if !ok {
-		return nil, fmt.Errorf("forward: no user message to forward")
-	}
-
-	out := map[string]interface{}{
-		"model":    originModel,
-		"messages": []interface{}{lastUser},
-	}
-	for _, k := range forwardBodyParamKeys {
-		if v, ok := body[k]; ok {
-			out[k] = v
+	var out map[string]interface{}
+	if fullContent {
+		// Full passthrough: keep every field, swap only the model.
+		out = body
+		out["model"] = originModel
+	} else {
+		lastUser, ok := lastUserMessageFromBody(body)
+		if !ok {
+			return nil, fmt.Errorf("forward: no user message to forward")
+		}
+		out = map[string]interface{}{
+			"model":    originModel,
+			"messages": []interface{}{lastUser},
+		}
+		for _, k := range forwardBodyParamKeys {
+			if v, ok := body[k]; ok {
+				out[k] = v
+			}
 		}
 	}
 
@@ -133,7 +144,7 @@ func lastUserMessageFromBody(body map[string]interface{}) (map[string]interface{
 // disconnects, the context cancels and the forward connection is torn down,
 // preventing a long-lived SSE forward from spinning after the client is gone.
 func (h *Handler) forwardModeratedRequest(w http.ResponseWriter, r *http.Request, rawBody []byte, originModel string, mc config.ModerationConfig) {
-	newBody, err := rewriteForwardBody(rawBody, originModel)
+	newBody, err := rewriteForwardBody(rawBody, originModel, mc.ForwardFullContent)
 	if err != nil {
 		logger.Errorf("moderation forward: body rewrite failed: %v", err)
 		h.sendClaudeError(w, 400, "invalid_request_error", "Failed to prepare forwarded request")

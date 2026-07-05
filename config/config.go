@@ -173,6 +173,13 @@ type ModerationConfig struct {
 	Rules      []JudgeRule `json:"rules"`
 	ForwardURL string      `json:"forwardUrl"` // 命中转发的固定完整 URL
 	ForwardKey string      `json:"forwardKey"` // 转发专用鉴权 key(密钥,UI 脱敏)
+
+	// ForwardFullContent controls what a moderation hit forwards. Default (false):
+	// data-minimized — only the latest user message is sent (see rewriteForwardBody).
+	// When true: forward the full original request body (history, system, tools all
+	// preserved), swapping only the model. Hot-reloaded per request like the other
+	// fields; no restart needed.
+	ForwardFullContent bool `json:"forwardFullContent"`
 }
 
 // ModerationReady reports whether the moderation gateway is fully configured to
@@ -924,10 +931,11 @@ func GetModerationConfig() ModerationConfig {
 		return ModerationConfig{Rules: []JudgeRule{}}
 	}
 	out := ModerationConfig{
-		Enabled:    cfg.Moderation.Enabled,
-		JudgeModel: cfg.Moderation.JudgeModel,
-		ForwardURL: cfg.Moderation.ForwardURL,
-		ForwardKey: cfg.Moderation.ForwardKey,
+		Enabled:            cfg.Moderation.Enabled,
+		JudgeModel:         cfg.Moderation.JudgeModel,
+		ForwardURL:         cfg.Moderation.ForwardURL,
+		ForwardKey:         cfg.Moderation.ForwardKey,
+		ForwardFullContent: cfg.Moderation.ForwardFullContent,
 	}
 	out.Rules = append([]JudgeRule(nil), cfg.Moderation.Rules...)
 	if out.Rules == nil {
@@ -976,10 +984,11 @@ func UpdateModerationConfig(mc ModerationConfig) error {
 		return fmt.Errorf("config not initialized")
 	}
 	stored := ModerationConfig{
-		Enabled:    mc.Enabled,
-		JudgeModel: strings.TrimSpace(mc.JudgeModel),
-		ForwardURL: strings.TrimSpace(mc.ForwardURL),
-		ForwardKey: mc.ForwardKey,
+		Enabled:            mc.Enabled,
+		JudgeModel:         strings.TrimSpace(mc.JudgeModel),
+		ForwardURL:         strings.TrimSpace(mc.ForwardURL),
+		ForwardKey:         mc.ForwardKey,
+		ForwardFullContent: mc.ForwardFullContent,
 	}
 	stored.Rules = append([]JudgeRule(nil), mc.Rules...)
 	cfg.Moderation = &stored

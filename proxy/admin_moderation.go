@@ -13,12 +13,13 @@ import (
 // mirroring the API-key masking convention. ForwardKeySet lets the UI show
 // whether a key exists at all (mask of an empty string is empty).
 type moderationView struct {
-	Enabled        bool               `json:"enabled"`
-	JudgeModel     string             `json:"judgeModel"`
-	Rules          []config.JudgeRule `json:"rules"`
-	ForwardURL     string             `json:"forwardUrl"`
-	ForwardKeyMask string             `json:"forwardKeyMasked"`
-	ForwardKeySet  bool               `json:"forwardKeySet"`
+	Enabled            bool               `json:"enabled"`
+	JudgeModel         string             `json:"judgeModel"`
+	Rules              []config.JudgeRule `json:"rules"`
+	ForwardURL         string             `json:"forwardUrl"`
+	ForwardKeyMask     string             `json:"forwardKeyMasked"`
+	ForwardKeySet      bool               `json:"forwardKeySet"`
+	ForwardFullContent bool               `json:"forwardFullContent"`
 }
 
 func toModerationView(mc config.ModerationConfig) moderationView {
@@ -27,12 +28,13 @@ func toModerationView(mc config.ModerationConfig) moderationView {
 		rules = []config.JudgeRule{}
 	}
 	return moderationView{
-		Enabled:        mc.Enabled,
-		JudgeModel:     mc.JudgeModel,
-		Rules:          rules,
-		ForwardURL:     mc.ForwardURL,
-		ForwardKeyMask: config.MaskApiKey(mc.ForwardKey),
-		ForwardKeySet:  strings.TrimSpace(mc.ForwardKey) != "",
+		Enabled:            mc.Enabled,
+		JudgeModel:         mc.JudgeModel,
+		Rules:              rules,
+		ForwardURL:         mc.ForwardURL,
+		ForwardKeyMask:     config.MaskApiKey(mc.ForwardKey),
+		ForwardKeySet:      strings.TrimSpace(mc.ForwardKey) != "",
+		ForwardFullContent: mc.ForwardFullContent,
 	}
 }
 
@@ -45,11 +47,12 @@ func (h *Handler) apiGetModeration(w http.ResponseWriter, r *http.Request) {
 // When ForwardKey is nil or equals the current masked value, the stored secret is
 // preserved — the UI never sees the cleartext key, so it round-trips the mask.
 type moderationUpdateRequest struct {
-	Enabled    bool               `json:"enabled"`
-	JudgeModel string             `json:"judgeModel"`
-	Rules      []config.JudgeRule `json:"rules"`
-	ForwardURL string             `json:"forwardUrl"`
-	ForwardKey *string            `json:"forwardKey,omitempty"`
+	Enabled            bool               `json:"enabled"`
+	JudgeModel         string             `json:"judgeModel"`
+	Rules              []config.JudgeRule `json:"rules"`
+	ForwardURL         string             `json:"forwardUrl"`
+	ForwardKey         *string            `json:"forwardKey,omitempty"`
+	ForwardFullContent bool               `json:"forwardFullContent"`
 }
 
 func (h *Handler) apiUpdateModeration(w http.ResponseWriter, r *http.Request) {
@@ -74,11 +77,12 @@ func (h *Handler) apiUpdateModeration(w http.ResponseWriter, r *http.Request) {
 	}
 
 	mc := config.ModerationConfig{
-		Enabled:    req.Enabled,
-		JudgeModel: req.JudgeModel,
-		Rules:      req.Rules,
-		ForwardURL: req.ForwardURL,
-		ForwardKey: forwardKey,
+		Enabled:            req.Enabled,
+		JudgeModel:         req.JudgeModel,
+		Rules:              req.Rules,
+		ForwardURL:         req.ForwardURL,
+		ForwardKey:         forwardKey,
+		ForwardFullContent: req.ForwardFullContent,
 	}
 
 	if err := config.UpdateModerationConfig(mc); err != nil {

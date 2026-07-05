@@ -392,6 +392,8 @@
   "moderation.forwardKey": "Forward Key",
   "moderation.forwardKeyPlaceholder": "Auth key sent to the forward target",
   "moderation.forwardKeyHint": "Stored as a secret and masked. Leave blank to keep the existing key.",
+  "moderation.forwardFullContent": "Forward full content on hit",
+  "moderation.forwardFullContentHint": "Off (default): only the latest user message is forwarded. On: the full original request (history, system, tools) is forwarded, model swapped only. Takes effect immediately, no restart.",
   "moderation.save": "Save Moderation Settings",
   "moderation.saved": "Moderation settings saved",
   "theme.toggle": "Toggle theme",

@@ -392,6 +392,8 @@
   "moderation.forwardKey": "转发 Key",
   "moderation.forwardKeyPlaceholder": "发送给转发目标的鉴权 key",
   "moderation.forwardKeyHint": "作为密钥存储并脱敏显示。留空则保留现有 key。",
+  "moderation.forwardFullContent": "命中时转发全部内容",
+  "moderation.forwardFullContentHint": "关闭（默认）：只转发最近一条 user 消息。开启：转发完整原始请求（历史、system、tools 全保留），仅替换 model。即时生效，无需重启。",
   "moderation.save": "保存审核设置",
   "moderation.saved": "审核设置已保存",
   "theme.toggle": "切换主题",
