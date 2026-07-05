@@ -356,6 +356,10 @@ var moderationTagTokenRe = func() *regexp.Regexp {
 // close (nothing is stripped past it) and a stray close with no open (ignored).
 // This affects ONLY the judge's copy; the forwarded body and logged Input keep
 // the full original message.
+//
+// Runs in O(n) over the token stream: a per-tag open-depth map makes a stray
+// close an O(1) skip, and each frame is pushed/popped at most once, so no input
+// (including adversarial crossed/unmatched tags) degrades to quadratic.
 func stripInjectedContext(text string) string {
 	matches := moderationTagTokenRe.FindAllStringSubmatchIndex(text, -1)
 	if len(matches) == 0 {
@@ -368,6 +372,11 @@ func stripInjectedContext(text string) string {
 	}
 	type span struct{ start, end int }
 	var stack []frame
+	// depth[tag] = number of currently-open frames with that tag name. This makes
+	// a stray close tag (no matching open) an O(1) skip instead of a full stack
+	// scan, which is what keeps the whole pass linear: without it, n unmatched
+	// closes over an n-deep open stack would be O(n^2).
+	depth := make(map[string]int)
 	var removals []span
 
 	for _, m := range matches {
@@ -377,12 +386,19 @@ func stripInjectedContext(text string) string {
 
 		if !isClose {
 			stack = append(stack, frame{tag: tag, start: tokStart})
+			depth[tag]++
 			continue
 		}
-		// Close tag: unwind to the nearest matching open. Any unclosed inner
-		// frames above it are discarded (they were inside this block). A stray
-		// close with no matching open is ignored (left as text).
+		// Stray close with no matching open anywhere in the stack → ignore in O(1).
+		if depth[tag] == 0 {
+			continue
+		}
+		// Unwind to the nearest matching open, discarding any unclosed inner frames
+		// above it (they were inside this block). depth[tag] > 0 guarantees the
+		// match exists, so the loop always breaks. Each frame is pushed once and
+		// popped once, so unwinding is amortized O(1) per token across the input.
 		for i := len(stack) - 1; i >= 0; i-- {
+			depth[stack[i].tag]--
 			if stack[i].tag == tag {
 				outerStart := stack[i].start
 				stack = stack[:i]

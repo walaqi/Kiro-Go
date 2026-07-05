@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"kiro-go/config"
 )
@@ -406,6 +407,53 @@ func TestStripInjectedContext(t *testing.T) {
 				t.Fatalf("stripInjectedContext(%q) = %q, want %q", c.in, got, c.want)
 			}
 		})
+	}
+}
+
+// TestStripInjectedContextCrossedTags covers improperly-crossed tags (XML-invalid
+// interleave): the inner different-name close appears before the outer close.
+// The outer block still ends at its own close and is removed whole; the crossed
+// inner close is treated as a stray within the block.
+func TestStripInjectedContextCrossedTags(t *testing.T) {
+	// <file_contents> opens, <document> opens inside, then </file_contents> closes
+	// the outer while <document> is still open. The outer block (opening through
+	// its matching close) is removed; the dangling </document> after it is a stray
+	// close (no open remains) and is left as text.
+	in := "a<file_contents>x<document>y</file_contents>z</document>b"
+	got := stripInjectedContext(in)
+	want := "az</document>b"
+	if got != want {
+		t.Fatalf("crossed tags: got %q, want %q", got, want)
+	}
+}
+
+// TestStripInjectedContextLinearOnStrayCloses is a complexity guard: a large run
+// of unmatched close tags over a deep open stack must stay linear, not O(n^2).
+// With the per-tag depth map each stray close is an O(1) skip; without it this
+// input would blow up. Bounded by a generous wall-clock deadline so a regression
+// to quadratic fails loudly instead of merely being slow.
+func TestStripInjectedContextLinearOnStrayCloses(t *testing.T) {
+	const n = 200000
+	// n deep opens (never closed) followed by n stray closes of a DIFFERENT tag,
+	// so every close scans nothing (depth==0 for that tag) — the exact shape that
+	// would be quadratic under a naive full-stack scan on each close.
+	var sb strings.Builder
+	for i := 0; i < n; i++ {
+		sb.WriteString("<document>")
+	}
+	for i := 0; i < n; i++ {
+		sb.WriteString("</file_contents>")
+	}
+	input := sb.String()
+
+	done := make(chan string, 1)
+	go func() { done <- stripInjectedContext(input) }()
+	select {
+	case <-done:
+		// Completed; correctness of this pathological input is not asserted (unclosed
+		// opens are left as text), only that it terminates quickly.
+	case <-time.After(5 * time.Second):
+		t.Fatal("stripInjectedContext did not finish in 5s on stray-close stress input (possible O(n^2) regression)")
 	}
 }
 
