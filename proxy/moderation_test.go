@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -120,6 +121,46 @@ func TestModerateMiss(t *testing.T) {
 	hit, _, err := m.Moderate("hello", []config.JudgeRule{{Enabled: true, Criteria: "x"}})
 	if err != nil || hit {
 		t.Fatalf("expected miss, got hit=%v err=%v", hit, err)
+	}
+}
+
+// TestJudgeAccumulatorDropsReasoning is the regression for the streaming-only
+// false-positive: the judge streams a reasoning trace (reasoningContentEvent,
+// isThinking=true) full of rule numbers before emitting the actual verdict. The
+// judge accumulator must fold in ONLY the final answer, so parseVerdict sees a
+// clean "0" and reports no violation — matching the non-stream shape a curl
+// replay observes. Before the fix, OnText ignored isThinking and appended the
+// reasoning too, so \d+ scraped "规则1…规则2…" into a spurious matched=[1,2].
+func TestJudgeAccumulatorDropsReasoning(t *testing.T) {
+	stream := bytes.NewReader(bytes.Join([][]byte{
+		// Reasoning trace mentioning both rule numbers, ending in the verdict.
+		awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{
+			"text": "规则1不适用，规则2只是打招呼吗？都不违反，判定为0",
+		}),
+		// The actual answer.
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+			"content": "0",
+		}),
+	}, nil))
+
+	// Mirror kiroJudgeCall's accumulator: skip thinking, keep the answer.
+	var content string
+	err := parseEventStream(stream, nil, &KiroStreamCallback{
+		OnText: func(text string, isThinking bool) {
+			if isThinking {
+				return
+			}
+			content += text
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+	if strings.TrimSpace(content) != "0" {
+		t.Fatalf("judge accumulator leaked reasoning: content=%q, want %q", content, "0")
+	}
+	if hit, matched := parseVerdict(content, 2); hit {
+		t.Fatalf("expected no violation, got hit with matched=%v (content=%q)", matched, content)
 	}
 }
 

@@ -179,7 +179,20 @@ func (h *Handler) kiroJudgeCall(model, prompt string) (string, error) {
 		var callErr error
 		var judgeCredits float64
 		callback := &KiroStreamCallback{
-			OnText:         func(text string, isThinking bool) { content += text },
+			// Accumulate ONLY the final answer, never the reasoning trace. The
+			// judge's streamed reasoning (reasoningContentEvent, isThinking=true)
+			// is prose like "规则1不适用…规则2只是打招呼吗…判定为0", which is riddled
+			// with rule numbers. Folding it into `content` let parseVerdict's \d+
+			// scan pick those up as spurious hits (e.g. "0" answer misread as 1,2),
+			// producing false moderation matches on the streaming path only — the
+			// non-stream shape a client sees never carries reasoning, which is why a
+			// curl replay returned a clean "0" but production logged 1,2.
+			OnText: func(text string, isThinking bool) {
+				if isThinking {
+					return
+				}
+				content += text
+			},
 			OnToolUse:      func(tu KiroToolUse) {},
 			OnComplete:     func(inTok, outTok int) {},
 			OnError:        func(err error) { callErr = err },
