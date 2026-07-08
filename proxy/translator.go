@@ -284,11 +284,27 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	currentToolResultIDs := collectToolResultIDs(currentToolResults)
 	keepCurrentToolResults := currentToolResultsMatchLastAssistant(history, currentToolResultIDs)
 
+	// tool_choice:"none" means the client forbids tool use this turn. Compute it
+	// before sanitizing history so we can strip every structured tool block: if
+	// any toolUse/toolResult survives, Bedrock demands a toolConfig, and supplying
+	// one (even a stub, see stubToolsFromHistory) would re-expose tools and defeat
+	// the "none" directive. Forcing the flatten path narrates the old tool activity
+	// into text instead, leaving zero structured blocks — no toolConfig needed, no
+	// tools advertised.
+	toolChoiceType, toolChoiceName := claudeToolChoiceTypeAndName(req.ToolChoice)
+	forbidTools := toolChoiceType == "none"
+	if forbidTools {
+		keepCurrentToolResults = false
+	}
+
 	// Flatten structured tool calls/results that live in history; upstream only
 	// accepts a single active tool turn (last assistant toolUses ⟺ current toolResults).
-	if keepCurrentToolResults {
+	switch {
+	case forbidTools:
+		history = sanitizeKiroHistoryFlatten(history, nil)
+	case keepCurrentToolResults:
 		history = sanitizeKiroHistory(history, currentToolResultIDs)
-	} else {
+	default:
 		history = sanitizeKiroHistory(history, nil)
 	}
 
@@ -304,10 +320,9 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		finalContent = minimalFallbackUserContent
 	}
 
-	// 转换工具
+	// 转换工具 (toolChoiceType/toolChoiceName computed above, before history sanitize)
 	toolsForConversion := req.Tools
-	toolChoiceType, toolChoiceName := claudeToolChoiceTypeAndName(req.ToolChoice)
-	if toolChoiceType == "none" {
+	if forbidTools {
 		toolsForConversion = nil
 	}
 	kiroTools, toolNameMap := convertClaudeTools(toolsForConversion, fc.ToolDescReplaceRules)
@@ -1577,35 +1592,124 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 	return sanitizeKiroHistoryFlatten(history, currentToolResultIDs)
 }
 
-// stubToolsFromHistory builds minimal tool definitions from structured toolUses
-// that survived in history. When the current request carries no tool definitions
-// but history retains structured toolUse/toolResult blocks (preserve mode),
-// upstream Bedrock requires a toolConfig to be present — otherwise it returns
-// HTTP 400 TOOL_CONFIG_MISSING. The stubs satisfy that requirement without
-// flattening history (which would inject mimicable "Tool results:" narration).
+// stubToolsFromHistory builds tool definitions from the structured toolUses that
+// survived in history. When the current request carries no tool definitions but
+// history retains structured toolUse/toolResult blocks (preserve mode), upstream
+// Bedrock requires a toolConfig to be present — otherwise it returns HTTP 400
+// ("The toolConfig field must be defined when using toolUse and toolResult content
+// blocks."). These stubs satisfy that requirement without flattening history
+// (which would inject mimicable "Tool results:" narration).
+//
+// The input schema is inferred from the actual arguments the model used when it
+// called each tool (KiroToolUse.Input) rather than left as an empty object, so a
+// stub declares the fields the tool was really invoked with. This keeps the stub
+// self-consistent if the model were to call the tool again, without caching the
+// original tool definitions across requests (which would add cross-request state
+// and, for a shared proxy, name-collision risk between clients).
+//
+// Tool names are taken verbatim from history and MUST NOT be re-sanitized: the
+// history's toolUse/toolResult blocks reference these exact names, so the
+// toolConfig entry has to match them exactly or Bedrock rejects the mismatch.
 func stubToolsFromHistory(history []KiroHistoryMessage) []KiroToolWrapper {
-	seen := make(map[string]bool)
-	var stubs []KiroToolWrapper
+	// Preserve first-seen order while accumulating every input sample per tool
+	// (a tool may be called multiple times with different arguments).
+	order := make([]string, 0)
+	samples := make(map[string][]map[string]interface{})
 	for i := range history {
-		if a := history[i].AssistantResponseMessage; a != nil {
-			for _, tu := range a.ToolUses {
-				if tu.Name != "" && !seen[tu.Name] {
-					seen[tu.Name] = true
-					stubs = append(stubs, KiroToolWrapper{})
-					s := &stubs[len(stubs)-1]
-					s.ToolSpecification.Name = tu.Name
-					s.ToolSpecification.Description = tu.Name
-					s.ToolSpecification.InputSchema = InputSchema{
-						JSON: map[string]interface{}{
-							"type":       "object",
-							"properties": map[string]interface{}{},
-						},
-					}
-				}
+		a := history[i].AssistantResponseMessage
+		if a == nil {
+			continue
+		}
+		for _, tu := range a.ToolUses {
+			if tu.Name == "" {
+				continue
+			}
+			if _, ok := samples[tu.Name]; !ok {
+				order = append(order, tu.Name)
+			}
+			if len(tu.Input) > 0 {
+				samples[tu.Name] = append(samples[tu.Name], tu.Input)
 			}
 		}
 	}
+
+	stubs := make([]KiroToolWrapper, 0, len(order))
+	for _, name := range order {
+		w := KiroToolWrapper{}
+		w.ToolSpecification.Name = name
+		w.ToolSpecification.Description = name
+		w.ToolSpecification.InputSchema = InputSchema{JSON: inferObjectSchema(samples[name])}
+		stubs = append(stubs, w)
+	}
 	return stubs
+}
+
+// inferObjectSchema derives a minimal JSON Schema object from the argument maps a
+// tool was actually called with. Each observed key becomes a property whose type
+// is guessed from the sample values. Bedrock only needs a well-formed object schema
+// here (it does not enforce required fields), so keys with a nil/unknown value are
+// declared without a type to stay permissive. With no samples it yields the same
+// empty-properties object the original stub used.
+//
+// A tool may be called multiple times with the same key holding different types
+// (e.g. timeout: 30 then timeout: "auto"). Rather than lock in whichever type was
+// seen first (too narrow) or emit a union type (Bedrock/Kiro union support is
+// unverified), a key with conflicting observed types is left untyped — the
+// permissive choice that still declares the property exists.
+func inferObjectSchema(inputs []map[string]interface{}) map[string]interface{} {
+	// Collect the distinct JSON Schema types observed for each key, preserving
+	// first-seen key order for stable output.
+	order := make([]string, 0)
+	types := make(map[string]map[string]bool)
+	for _, in := range inputs {
+		for key, val := range in {
+			if _, ok := types[key]; !ok {
+				types[key] = make(map[string]bool)
+				order = append(order, key)
+			}
+			if t := jsonSchemaType(val); t != "" {
+				types[key][t] = true
+			}
+		}
+	}
+
+	properties := make(map[string]interface{}, len(order))
+	for _, key := range order {
+		prop := map[string]interface{}{}
+		// Emit a type only when every observation agreed on exactly one; a
+		// conflict (or a lone untyped/nil sample) stays permissive.
+		if seen := types[key]; len(seen) == 1 {
+			for t := range seen {
+				prop["type"] = t
+			}
+		}
+		properties[key] = prop
+	}
+	return map[string]interface{}{
+		"type":       "object",
+		"properties": properties,
+	}
+}
+
+// jsonSchemaType maps a decoded JSON value to its JSON Schema primitive type name.
+// Returns "" for nil/unknown so the property stays untyped (permissive). JSON
+// numbers decode to float64 via encoding/json; the extra numeric cases are
+// defensive.
+func jsonSchemaType(v interface{}) string {
+	switch v.(type) {
+	case string:
+		return "string"
+	case bool:
+		return "boolean"
+	case float64, int, int64, json.Number:
+		return "number"
+	case []interface{}:
+		return "array"
+	case map[string]interface{}:
+		return "object"
+	default:
+		return ""
+	}
 }
 
 // sanitizeKiroHistoryPreserve keeps structured tool calls/results in history
