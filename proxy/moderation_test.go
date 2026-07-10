@@ -28,6 +28,25 @@ func TestParseVerdict(t *testing.T) {
 		{"out of range ignored", "5", 3, false, nil},
 		{"mixed in/out of range", "2, 9", 3, true, []int{2}},
 		{"dedupe", "2 2 2", 3, true, []int{2}},
+		// A hijacked/verbose judge wraps a numbered analysis in <analysis>…</analysis>.
+		// The block is stripped before scanning, so its list numbers ("1.", "2.")
+		// are NOT mistaken for matched rules. This is the real production false
+		// positive: reply was ALL analysis, so stripping empties it → no violation.
+		{"analysis block only → no hit", "<analysis>\n1. Initial request\n2. Exploration\n</analysis>", 3, false, nil},
+		{"analysis block with surrounding whitespace", "  <analysis>rules 1 and 2 discussed</analysis>  ", 3, false, nil},
+		// A real verdict OUTSIDE the analysis block survives stripping.
+		{"verdict after analysis", "<analysis>considered rule 1 and 2</analysis>2", 3, true, []int{2}},
+		{"verdict before analysis", "0 <analysis>rule 1, rule 3 examined</analysis>", 3, false, nil},
+		// Case-insensitive tag matching, mirroring stripTagBlocks.
+		{"uppercase analysis tag", "<ANALYSIS>1. foo 2. bar</ANALYSIS>", 3, false, nil},
+		// DELIBERATE: an UNCLOSED <analysis> (no matching </analysis>) is NOT
+		// stripped — stripTagBlocks leaves unbalanced opens as text so it never
+		// deletes past an opener it can't pair. The consequence is that a
+		// truncated analysis wrapper can still leak its list numbers into the
+		// \d+ scan and produce a false hit. This is a known residual gap, kept
+		// intentionally to preserve the "never over-strip" safety property; it
+		// is asserted here so the behavior is documented, not silently changed.
+		{"unclosed analysis still scanned (residual gap)", "<analysis>1. foo 2. bar", 3, true, []int{1, 2}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

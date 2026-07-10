@@ -86,7 +86,19 @@ var numberPattern = regexp.MustCompile(`\d+`)
 // Any number in [1..ruleCount] counts as a hit for that rule; 0 (and only 0) is
 // the explicit "no violation" signal. Numbers out of range are ignored (model
 // noise). hit is true when at least one in-range rule number is present.
+//
+// Before scanning for numbers it strips reasoning/analysis wrapper blocks
+// (verdictStripTags, e.g. <analysis>…</analysis>) from the reply. A hijacked or
+// verbose judge emits a long analysis full of numbered list items whose numbers
+// the \d+ scan would otherwise mistake for matched rules; removing the wrapper
+// leaves only the bare verdict. If nothing remains after stripping (the reply
+// was ALL analysis, with no verdict outside it), there is no violation signal —
+// return no hit rather than inventing one from the analysis's list numbers.
 func parseVerdict(reply string, ruleCount int) (hit bool, matched []int) {
+	reply = stripVerdictTags(reply)
+	if reply == "" {
+		return false, nil
+	}
 	found := numberPattern.FindAllString(reply, -1)
 	seen := make(map[int]bool)
 	for _, s := range found {
@@ -358,28 +370,71 @@ var moderationTagTokenRe = func() *regexp.Regexp {
 	return regexp.MustCompile(pattern)
 }()
 
-// stripInjectedContext removes client-injected context tag BLOCKS (opening tag
-// through its matching close, contents included) before the text is classified
-// by the judge, then trims whitespace.
+// verdictStripTags are wrapper tags a judge model may emit AROUND its verdict —
+// reasoning/analysis scaffolding such as <analysis>…</analysis>. A hijacked or
+// verbose judge (e.g. one that follows agent instructions smuggled inside the
+// user text) produces a long analysis full of numbered list items ("1. …",
+// "2. …") instead of a bare verdict; parseVerdict's \d+ scan would otherwise
+// scrape those list numbers as matched rule numbers. These blocks are removed
+// from the judge's REPLY before the verdict is parsed.
+//
+// This is the OUTPUT-side analogue of moderationStripTags (which strips the
+// judge's INPUT). The two lists are deliberately separate: expanding the input
+// whitelist risks changing what the judge classifies, whereas stripping the
+// judge's own reasoning wrapper from its reply cannot affect classification.
+var verdictStripTags = []string{
+	"analysis",
+}
+
+// verdictTagTokenRe is the OUTPUT-side counterpart of moderationTagTokenRe,
+// matching a single open/close token for any verdictStripTags name with the same
+// exact-boundary and ReDoS-safety guarantees.
+var verdictTagTokenRe = func() *regexp.Regexp {
+	alts := make([]string, len(verdictStripTags))
+	for i, tag := range verdictStripTags {
+		alts[i] = regexp.QuoteMeta(tag)
+	}
+	pattern := `(?is)<(/?)(` + strings.Join(alts, "|") + `)(?:\s(?:"[^"]*"|'[^']*'|[^>])*)?>`
+	return regexp.MustCompile(pattern)
+}()
+
+// stripInjectedContext removes client-injected context tag BLOCKS
+// (moderationStripTags) before the text is classified by the judge. See
+// stripTagBlocks for the removal semantics. This affects ONLY the judge's copy;
+// the forwarded body and logged Input keep the full original message.
+func stripInjectedContext(text string) string {
+	return stripTagBlocks(text, moderationTagTokenRe)
+}
+
+// stripVerdictTags removes reasoning/analysis wrapper blocks (verdictStripTags,
+// e.g. <analysis>…</analysis>) from a judge's REPLY before the verdict is parsed,
+// using the same depth-aware, ReDoS-safe block removal as stripInjectedContext.
+// See verdictStripTags for why this is separate from the input-side stripping.
+func stripVerdictTags(text string) string {
+	return stripTagBlocks(text, verdictTagTokenRe)
+}
+
+// stripTagBlocks removes whole tag BLOCKS (opening tag through its matching
+// close, contents included) for any tag the given tokenRe matches, then trims
+// whitespace. tokenRe MUST expose group 1 = "/?" (close marker) and group 2 =
+// tag name, exactly like moderationTagTokenRe / verdictTagTokenRe.
 //
 // It uses a depth-aware stack scan rather than a single non-greedy regex, which
 // cannot handle same-name nesting: a plain <tag>.*?</tag> stops at the FIRST
-// close, leaking the remainder of a nested block to the judge. Here a block is
-// removed only when its opening tag's matching close returns the stack to empty,
-// so a nested / interleaved structure such as
+// close, leaking the remainder of a nested block. Here a block is removed only
+// when its opening tag's matching close returns the stack to empty, so a nested
+// / interleaved structure such as
 //
 //	<file_contents>outer <file_contents>inner</file_contents> more</file_contents>
 //
 // is removed whole. Unbalanced tags are left as text: an opening tag with no
 // close (nothing is stripped past it) and a stray close with no open (ignored).
-// This affects ONLY the judge's copy; the forwarded body and logged Input keep
-// the full original message.
 //
 // Runs in O(n) over the token stream: a per-tag open-depth map makes a stray
 // close an O(1) skip, and each frame is pushed/popped at most once, so no input
 // (including adversarial crossed/unmatched tags) degrades to quadratic.
-func stripInjectedContext(text string) string {
-	matches := moderationTagTokenRe.FindAllStringSubmatchIndex(text, -1)
+func stripTagBlocks(text string, tokenRe *regexp.Regexp) string {
+	matches := tokenRe.FindAllStringSubmatchIndex(text, -1)
 	if len(matches) == 0 {
 		return strings.TrimSpace(text)
 	}
