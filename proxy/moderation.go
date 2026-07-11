@@ -150,8 +150,15 @@ func (m *llmModerator) Moderate(userText string, rules []config.JudgeRule) (bool
 	// eyeball hit/miss accuracy during a trial period without a standing info-level
 	// stream that would echo conversation content into normal logs. Turn on with
 	// LOG_LEVEL=debug; turn off by reverting to info — no code change needed.
+	// reply is logged in FULL (no truncation): we are investigating whether a
+	// verbose/hijacked judge reply carries an *unclosed* reasoning wrapper (e.g. a
+	// <analysis> block cut off by the judge's own MaxTokens) that defeats
+	// stripVerdictTags. Clipping the reply to moderationLogMaxRunes would hide the
+	// tail and make it impossible to tell a truncated-by-us tag from a
+	// truncated-by-judge one. userText stays clipped — it is full conversation
+	// content and must not be written to logs in full.
 	logger.Debugf("moderation judge: verdict hit=%v matched=%v | reply=%q | userText=%q",
-		hit, matched, truncateForLog(reply), truncateForLog(userText))
+		hit, matched, reply, truncateForLog(userText))
 	return hit, matched, nil
 }
 
