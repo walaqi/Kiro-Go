@@ -137,11 +137,15 @@ var numberPattern = regexp.MustCompile(`\d+`)
 // volume rises unacceptably during observation.
 func parseVerdict(reply string, ruleCount int) (hit bool, matched []int) {
 	// Strip analysis/reasoning wrappers so a judge that reasons then answers
-	// cleanly still passes, then trim a tolerated trailing period/space.
-	s := strings.TrimRight(strings.TrimSpace(stripVerdictTags(reply)), ". \t")
+	// cleanly still passes.
+	s := strings.TrimSpace(stripVerdictTags(reply))
 
-	// The only pass: a clean, lone "0".
-	if s == "0" {
+	// The only pass: a clean, lone "0", optionally with a single trailing period
+	// ("0."). Match these EXACTLY rather than trimming a character set — a broad
+	// TrimRight(". \t") would collapse malformed replies like "0...", "0 .", or
+	// "0\t.\t" down to "0" and wrongly pass them. Under fail-toward-hit anything
+	// that is not an unambiguous "0"/"0." must forward, so no fuzzy trimming.
+	if s == "0" || s == "0." {
 		return false, nil
 	}
 

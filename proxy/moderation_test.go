@@ -27,10 +27,16 @@ func TestParseVerdict(t *testing.T) {
 		wantHit   bool
 		wantMatch []int
 	}{
-		// The only pass: a clean lone "0" (optionally with a tolerated trailing dot).
+		// The only pass: a clean lone "0" (optionally with a single trailing dot).
 		{"explicit none", "0", 3, false, nil},
 		{"none with trailing period", "0.", 3, false, nil},
 		{"none with whitespace", "  0  ", 3, false, nil},
+		// Malformed zero variants must NOT collapse to a pass — under fail-toward-hit
+		// only an exact "0"/"0." passes; fuzzy trailing junk is a forced hit.
+		{"double dot zero → forced hit", "0..", 3, true, nil},
+		{"zero space dot → forced hit", "0 .", 3, true, nil},
+		{"zero tab dot → forced hit", "0\t.\t", 3, true, nil},
+		{"zero with trailing prose → forced hit", "0 no violation", 3, true, nil},
 		// Clean lists name their in-range rules.
 		{"single hit", "2", 3, true, []int{2}},
 		{"multi hit", "1,3", 3, true, []int{1, 3}},
