@@ -13,6 +13,12 @@ import (
 
 // --- judge engine: verdict parsing & rule filtering ---
 
+// TestParseVerdict pins the FAIL-TOWARD-HIT policy ("宁可错杀,不可放过"): the ONLY
+// reply that passes (no hit) is a clean, unambiguous "0". Everything else —
+// prose, a hijacked judge that emitted an analysis/summary instead of a verdict,
+// an unclosed wrapper, an out-of-range number, an empty reply — is a forced hit.
+// A forced hit reports matched=nil (the judge did not name rules cleanly); a
+// clean list "1,3" reports the named in-range rules.
 func TestParseVerdict(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -21,32 +27,43 @@ func TestParseVerdict(t *testing.T) {
 		wantHit   bool
 		wantMatch []int
 	}{
+		// The only pass: a clean lone "0" (optionally with a single trailing dot).
 		{"explicit none", "0", 3, false, nil},
+		{"none with trailing period", "0.", 3, false, nil},
+		{"none with whitespace", "  0  ", 3, false, nil},
+		// Malformed zero variants must NOT collapse to a pass — under fail-toward-hit
+		// only an exact "0"/"0." passes; fuzzy trailing junk is a forced hit.
+		{"double dot zero → forced hit", "0..", 3, true, nil},
+		{"zero space dot → forced hit", "0 .", 3, true, nil},
+		{"zero tab dot → forced hit", "0\t.\t", 3, true, nil},
+		{"zero with trailing prose → forced hit", "0 no violation", 3, true, nil},
+		// Clean lists name their in-range rules.
 		{"single hit", "2", 3, true, []int{2}},
 		{"multi hit", "1,3", 3, true, []int{1, 3}},
-		{"noisy prose", "Rules 1 and 3 are violated.", 3, true, []int{1, 3}},
-		{"out of range ignored", "5", 3, false, nil},
-		{"mixed in/out of range", "2, 9", 3, true, []int{2}},
-		{"dedupe", "2 2 2", 3, true, []int{2}},
-		// A hijacked/verbose judge wraps a numbered analysis in <analysis>…</analysis>.
-		// The block is stripped before scanning, so its list numbers ("1.", "2.")
-		// are NOT mistaken for matched rules. This is the real production false
-		// positive: reply was ALL analysis, so stripping empties it → no violation.
-		{"analysis block only → no hit", "<analysis>\n1. Initial request\n2. Exploration\n</analysis>", 3, false, nil},
-		{"analysis block with surrounding whitespace", "  <analysis>rules 1 and 2 discussed</analysis>  ", 3, false, nil},
-		// A real verdict OUTSIDE the analysis block survives stripping.
-		{"verdict after analysis", "<analysis>considered rule 1 and 2</analysis>2", 3, true, []int{2}},
-		{"verdict before analysis", "0 <analysis>rule 1, rule 3 examined</analysis>", 3, false, nil},
-		// Case-insensitive tag matching, mirroring stripTagBlocks.
-		{"uppercase analysis tag", "<ANALYSIS>1. foo 2. bar</ANALYSIS>", 3, false, nil},
-		// DELIBERATE: an UNCLOSED <analysis> (no matching </analysis>) is NOT
-		// stripped — stripTagBlocks leaves unbalanced opens as text so it never
-		// deletes past an opener it can't pair. The consequence is that a
-		// truncated analysis wrapper can still leak its list numbers into the
-		// \d+ scan and produce a false hit. This is a known residual gap, kept
-		// intentionally to preserve the "never over-strip" safety property; it
-		// is asserted here so the behavior is documented, not silently changed.
-		{"unclosed analysis still scanned (residual gap)", "<analysis>1. foo 2. bar", 3, true, []int{1, 2}},
+		{"list with spaces", "1, 3", 3, true, []int{1, 3}},
+		{"dedupe not needed for clean list", "2", 3, true, []int{2}},
+		// Out-of-range-only clean list is NOT a clean "0" → forced hit, no named rules.
+		{"out of range → forced hit", "5", 3, true, nil},
+		{"mixed in/out of range keeps in-range", "2,9", 3, true, []int{2}},
+		// Prose is no longer parsed for numbers — it's a forced hit with no named rules.
+		{"noisy prose → forced hit", "Rules 1 and 3 are violated.", 3, true, nil},
+		{"empty reply → forced hit", "", 3, true, nil},
+		{"zero mixed with prose → forced hit", "0 but also consider 1", 3, true, nil},
+		// A judge that reasons in <analysis>…</analysis> and THEN answers cleanly
+		// still passes / hits on the bare verdict left after stripping.
+		{"analysis then clean none", "<analysis>\n1. Initial request\n2. Exploration\n</analysis>\n\n0", 3, false, nil},
+		{"analysis then clean hit", "<analysis>considered rule 1 and 2</analysis>2", 3, true, []int{2}},
+		{"analysis before clean none", "0 <analysis>rule 1, rule 3 examined</analysis>", 3, false, nil},
+		{"uppercase analysis then none", "<ANALYSIS>1. foo 2. bar</ANALYSIS>0", 3, false, nil},
+		// A hijacked judge emits ONLY analysis/summary, no bare verdict. Under
+		// fail-toward-hit this is a forced hit (no clean "0" survives), NOT a pass.
+		// This is the real production case: benign request, judge wrote a summary.
+		{"analysis block only → forced hit", "<analysis>\n1. Initial request\n2. Exploration\n</analysis>", 3, true, nil},
+		{"summary block (not stripped) → forced hit", "<summary>\n1. Primary intent\n2. Concepts\n</summary>", 3, true, nil},
+		// An UNCLOSED <analysis> is not stripped (stripTagBlocks never deletes past
+		// an opener it can't pair). Under fail-toward-hit the leftover prose is a
+		// forced hit regardless — no more "leaks list numbers as false rules".
+		{"unclosed analysis → forced hit", "<analysis>1. foo 2. bar", 3, true, nil},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
