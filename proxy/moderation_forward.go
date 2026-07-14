@@ -54,6 +54,13 @@ var forwardBodyParamKeys = []string{
 // standard-compliant forward target would 400 without it. Conservative default.
 const defaultForwardMaxTokens = 1024
 
+// anthropicVersionHeader is sent on the forwarded request. The forward target is a
+// strict Anthropic-compatible gateway that requires the anthropic-version header
+// and would reject (400) a request without it — this matters especially in full-
+// content mode, where the forwarded body carries features (system, tools,
+// cache_control) that a bare minimized request does not.
+const anthropicVersionHeader = "2023-06-01"
+
 // rewriteForwardBody rebuilds the forward request body from the downstream
 // request. Behavior depends on fullContent:
 //
@@ -177,14 +184,6 @@ func (h *Handler) forwardModeratedRequest(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Observation log (debug-gated): the exact body about to be forwarded, printed
-	// in full so operators can confirm it carries NO filter injection / system-
-	// prompt rewrite (those only happen inside ClaudeToKiro, which the forward path
-	// never touches — only "model" is swapped). Full text, not clipped, since the
-	// system field is what we're verifying and it can sit anywhere in the body.
-	// Turn on with LOG_LEVEL=debug; revert to info to stop. May be large.
-	logger.Debugf("moderation forward: POST %s (model→%q), body=%s", mc.ForwardURL, originModel, string(newBody))
-
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, mc.ForwardURL, bytes.NewReader(newBody))
 	if err != nil {
 		logger.Errorf("moderation forward: build request failed: %v", err)
@@ -198,6 +197,9 @@ func (h *Handler) forwardModeratedRequest(w http.ResponseWriter, r *http.Request
 	// compatible gateways.)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+mc.ForwardKey)
+	// The forward target is a strict Anthropic-compatible gateway that requires the
+	// anthropic-version header; without it the request is rejected with a 400.
+	req.Header.Set("anthropic-version", anthropicVersionHeader)
 
 	resp, err := getForwardClient().Do(req)
 	if err != nil {
@@ -206,6 +208,20 @@ func (h *Handler) forwardModeratedRequest(w http.ResponseWriter, r *http.Request
 		return
 	}
 	defer resp.Body.Close()
+
+	// Observation log (debug-gated): recorded AFTER the target responds so it
+	// carries the actual outcome. On success (2xx) log the full forwarded body so
+	// operators can confirm it carried NO filter injection / system-prompt rewrite
+	// (those only happen inside ClaudeToKiro, which the forward path never touches —
+	// only "model" is swapped); the full text is needed since the system field can
+	// sit anywhere in the body. On failure log ONLY the status code — the response
+	// body may be large and is not what we're verifying. Turn on with
+	// LOG_LEVEL=debug; revert to info to stop.
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		logger.Debugf("moderation forward: OK %d, POST %s (model→%q), body=%s", resp.StatusCode, mc.ForwardURL, originModel, string(newBody))
+	} else {
+		logger.Debugf("moderation forward: FAILED status=%d, POST %s (model→%q)", resp.StatusCode, mc.ForwardURL, originModel)
+	}
 
 	// Pass through the target's real response shape: status + Content-Type (so the
 	// downstream sees SSE vs JSON), plus a couple of streaming-relevant headers.
