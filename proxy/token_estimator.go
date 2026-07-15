@@ -136,6 +136,20 @@ func estimateClaudeValueTokens(v interface{}) int {
 			}
 		}
 
+		// Any image block (image/image_url/input_image, file/input_file, or a
+		// typeless block carrying an image payload) is costed by its dimensions
+		// rather than letting the base64 fall through to countClaudeJSONTokens
+		// below, which would count the encoded bytes as text and inflate the
+		// estimate by 1-2 orders of magnitude. classifyImagePart mirrors the
+		// translator's recognition so we never diverge from what is actually
+		// uploaded as an image.
+		if data, isImage := classifyImagePart(value); isImage {
+			if data == "" {
+				return fallbackImageTokens
+			}
+			return estimateImageTokens(data)
+		}
+
 		total := 0
 		if text, ok := value["text"].(string); ok {
 			total += countTokens(text)
@@ -200,13 +214,45 @@ func estimateOpenAIContentTokens(content interface{}) int {
 		return 0
 	case string:
 		return estimateApproxTokens(value)
-	default:
-		text := extractOpenAIMessageText(value)
-		if text != "" {
-			return estimateApproxTokens(text)
+	case []interface{}:
+		total := 0
+		for _, part := range value {
+			total += estimateOpenAIPartTokens(part)
 		}
+		return total
+	case map[string]interface{}:
+		return estimateOpenAIPartTokens(value)
+	default:
 		return estimateJSONTokens(value)
 	}
+}
+
+// estimateOpenAIPartTokens estimates one OpenAI content part. Image parts are
+// costed by their dimensions via estimateImageTokens (using the shared
+// classifyImagePart oracle so recognition matches the translator); text parts
+// use the character heuristic. Image is checked before text so a single part
+// that carries both a caption field and an image payload is not under-counted
+// as text-only. This deliberately avoids extractOpenAIMessageText, whose
+// JSON-marshal fallback would emit an image part's base64 payload and count it
+// as text.
+func estimateOpenAIPartTokens(part interface{}) int {
+	m, ok := part.(map[string]interface{})
+	if !ok {
+		return estimateOpenAIContentTokens(part)
+	}
+	if data, isImage := classifyImagePart(m); isImage {
+		if data == "" {
+			return fallbackImageTokens
+		}
+		return estimateImageTokens(data)
+	}
+	if t, ok := extractOpenAITextPart(m); ok {
+		return estimateApproxTokens(t)
+	}
+	if nested, ok := m["content"]; ok {
+		return estimateOpenAIContentTokens(nested)
+	}
+	return estimateJSONTokens(m)
 }
 
 func estimateOpenAIOutputTokens(content, reasoningContent string, toolUses []KiroToolUse) int {

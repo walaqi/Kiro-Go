@@ -80,9 +80,9 @@ func convertResponsesInputItems(items []json.RawMessage) ([]OpenAIMessage, error
 			if callID == "" {
 				callID, _ = obj["tool_call_id"].(string)
 			}
-			out := stringifyArbitrary(obj["output"])
-			if out == "" {
-				out = stringifyArbitrary(obj["content"])
+			out := toolOutputContent(obj["output"])
+			if out == nil {
+				out = toolOutputContent(obj["content"])
 			}
 			messages = append(messages, OpenAIMessage{
 				Role:       "tool",
@@ -219,6 +219,92 @@ func stringifyArbitrary(v interface{}) string {
 		}
 		return string(b)
 	}
+}
+
+// toolOutputContent normalizes a Responses tool-output value into an
+// OpenAIMessage.Content. When the output is an array containing an image part
+// that the translator can actually upload (classifyImagePart), it returns a
+// normalized []interface{} so downstream conversion and token estimation see
+// the image instead of a base64 blob buried in a JSON string. To avoid changing
+// the old stringify semantics for everything else, non-image parts in that same
+// array are collapsed into text (image parts kept as-is), rather than dropping
+// siblings or preserving unknown objects verbatim. Text-only or arbitrary
+// output keeps the previous single-string form. Returns nil for an
+// empty/absent value so the caller can fall back to the alternate field.
+func toolOutputContent(v interface{}) interface{} {
+	switch t := v.(type) {
+	case nil:
+		return nil
+	case string:
+		if t == "" {
+			return nil
+		}
+		return t
+	case []interface{}:
+		if parts := normalizeToolOutputParts(t); parts != nil {
+			return parts
+		}
+	case map[string]interface{}:
+		if parts := normalizeToolOutputParts([]interface{}{t}); parts != nil {
+			return parts
+		}
+	}
+	if s := stringifyArbitrary(v); s != "" {
+		return s
+	}
+	return nil
+}
+
+// normalizeToolOutputParts returns a normalized content-part slice when the
+// array carries at least one uploadable image part, or nil to signal the caller
+// should fall back to plain stringify. Image parts are kept structurally; every
+// other element is folded into a single input_text block so no sibling content
+// is lost (the pre-change behavior stringified the whole value). It keys image
+// recognition off classifyImagePart so it matches exactly what the translator
+// will forward as an image.
+func normalizeToolOutputParts(parts []interface{}) []interface{} {
+	hasImage := false
+	var texts []string
+
+	for _, p := range parts {
+		if m, ok := p.(map[string]interface{}); ok {
+			if _, isImage := classifyImagePart(m); isImage {
+				hasImage = true
+				continue
+			}
+			if t, ok := extractOpenAITextPart(m); ok {
+				texts = append(texts, t)
+				continue
+			}
+		}
+		// Unknown element: preserve its content as text rather than dropping it.
+		if s := stringifyArbitrary(p); s != "" {
+			texts = append(texts, s)
+		}
+	}
+
+	if !hasImage {
+		return nil
+	}
+
+	// Emit image parts in their original order, then the folded text. Element
+	// boundaries are preserved by joining with newlines so distinct siblings
+	// (e.g. "ab", {"x":1}, "cd") don't merge into one run.
+	out := make([]interface{}, 0, len(parts)+1)
+	for _, p := range parts {
+		if m, ok := p.(map[string]interface{}); ok {
+			if _, isImage := classifyImagePart(m); isImage {
+				out = append(out, m)
+			}
+		}
+	}
+	if len(texts) > 0 {
+		out = append(out, map[string]interface{}{
+			"type": "input_text",
+			"text": strings.Join(texts, "\n"),
+		})
+	}
+	return out
 }
 
 func stringField(obj map[string]interface{}, keys ...string) string {
