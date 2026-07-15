@@ -137,16 +137,17 @@ func TestEstimateOpenAIContentTokensImageIsBounded(t *testing.T) {
 	}
 }
 
-func TestImageDataFromClaudeBlockPrefersSourceData(t *testing.T) {
+func TestClassifyClaudeImagePartPrefersSourceData(t *testing.T) {
 	block := map[string]interface{}{
 		"type": "image",
 		"source": map[string]interface{}{
-			"data": "AAAA",
+			"data": "AAAA", // bare base64 -> a local payload
 			"url":  "https://example.com/x.png",
 		},
 	}
-	if got := imageDataFromClaudeBlock(block); got != "AAAA" {
-		t.Fatalf("got %q, want source.data", got)
+	got, isImage := classifyClaudeImagePart(block)
+	if !isImage || got != "AAAA" {
+		t.Fatalf("got (%q, %v), want (\"AAAA\", true)", got, isImage)
 	}
 }
 
@@ -202,109 +203,84 @@ func TestToolOutputContentStringifiesNonImage(t *testing.T) {
 	}
 }
 
-// TestClassifyImagePartMatchesTranslator asserts the estimator's recognition
-// oracle stays aligned with the translator's image extractor: every shape the
-// translator would upload as an image is classified as one, and shapes it
-// forwards as text are not. This is the invariant that keeps the estimate
-// consistent with what is actually sent upstream.
-func TestClassifyImagePartMatchesTranslator(t *testing.T) {
+// TestClassifiersMatchTranslatorExtractors asserts each dialect recognizer
+// agrees EXACTLY (image-or-not) with the translator extractor that actually
+// runs on its call site: classifyClaudeImagePart vs extractImageFromClaudeBlock,
+// classifyOpenAIImagePart vs extractImageFromOpenAIPart. This is the invariant
+// that keeps the estimate consistent with what is uploaded, and it covers the
+// forms where the two extractors diverge (source-shaped base64, output_image).
+func TestClassifiersMatchTranslatorExtractors(t *testing.T) {
 	imgData := makePNGBase64(t, 16, 16)
 	dataURL := "data:image/png;base64," + imgData
 
-	// dialect selects which real translator extractor a shape must agree with,
-	// so the cross-check is per-call-site rather than "either one succeeds":
-	// Claude messages use extractImageFromClaudeBlock, OpenAI/Responses use
-	// extractImageFromOpenAIPart.
-	const (
-		claude = "claude"
-		openai = "openai"
-		both   = "both"
-	)
-
-	cases := []struct {
-		name      string
-		part      map[string]interface{}
-		wantImage bool
-		dialect   string // which extractor must agree when wantImage is true
+	shapes := []struct {
+		name string
+		part map[string]interface{}
 	}{
-		{
-			name: "claude source base64",
-			part: map[string]interface{}{
-				"type":   "image",
-				"source": map[string]interface{}{"type": "base64", "media_type": "image/png", "data": imgData},
-			},
-			wantImage: true,
-			dialect:   claude,
-		},
-		{
-			name:      "openai image_url data url",
-			part:      map[string]interface{}{"type": "image_url", "image_url": map[string]interface{}{"url": dataURL}},
-			wantImage: true,
-			dialect:   both,
-		},
-		{
-			name:      "file wrapper with data url",
-			part:      map[string]interface{}{"type": "file", "file": map[string]interface{}{"data": dataURL}},
-			wantImage: true,
-			dialect:   openai,
-		},
-		{
-			name:      "typeless block carrying image payload",
-			part:      map[string]interface{}{"image_url": map[string]interface{}{"url": dataURL}},
-			wantImage: true,
-			dialect:   both,
-		},
-		{
-			name:      "output_image excluded (translator rejects)",
-			part:      map[string]interface{}{"type": "output_image", "image_url": map[string]interface{}{"url": dataURL}},
-			wantImage: false,
-		},
-		{
-			name:      "remote url not local image",
-			part:      map[string]interface{}{"type": "image_url", "image_url": map[string]interface{}{"url": "https://example.com/x.png"}},
-			wantImage: false,
-		},
-		{
-			name:      "non-image mime gated out",
-			part:      map[string]interface{}{"type": "file", "mime_type": "application/pdf", "data": dataURL},
-			wantImage: false,
-		},
-		{
-			name:      "plain text block",
-			part:      map[string]interface{}{"type": "text", "text": "hello"},
-			wantImage: false,
-		},
+		{"claude source base64 typed", map[string]interface{}{
+			"type":   "image",
+			"source": map[string]interface{}{"type": "base64", "media_type": "image/png", "data": imgData},
+		}},
+		{"openai image_url data url", map[string]interface{}{
+			"type": "image_url", "image_url": map[string]interface{}{"url": dataURL},
+		}},
+		{"file wrapper with data url", map[string]interface{}{
+			"type": "file", "file": map[string]interface{}{"data": dataURL},
+		}},
+		{"typeless image_url", map[string]interface{}{
+			"image_url": map[string]interface{}{"url": dataURL},
+		}},
+		{"output_image with source.data", map[string]interface{}{
+			"type": "output_image", "source": map[string]interface{}{"data": imgData},
+		}},
+		{"output_image with image_url", map[string]interface{}{
+			"type": "output_image", "image_url": map[string]interface{}{"url": dataURL},
+		}},
+		{"source-only base64 typeless", map[string]interface{}{
+			"source": map[string]interface{}{"data": imgData},
+		}},
+		{"remote url", map[string]interface{}{
+			"type": "image_url", "image_url": map[string]interface{}{"url": "https://example.com/x.png"},
+		}},
+		{"non-image mime file", map[string]interface{}{
+			"type": "file", "mime_type": "application/pdf", "data": dataURL,
+		}},
+		{"plain text", map[string]interface{}{"type": "text", "text": "hello"}},
+		{"b64_json", map[string]interface{}{"type": "image", "b64_json": imgData}},
 	}
 
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			gotData, gotImage := classifyImagePart(c.part)
-			if gotImage != c.wantImage {
-				t.Fatalf("isImage = %v, want %v (data=%q)", gotImage, c.wantImage, gotData)
+	for _, s := range shapes {
+		t.Run(s.name, func(t *testing.T) {
+			_, gotClaude := classifyClaudeImagePart(s.part)
+			wantClaude := extractImageFromClaudeBlock(s.part) != nil
+			if gotClaude != wantClaude {
+				t.Errorf("Claude: classifier=%v extractor=%v", gotClaude, wantClaude)
 			}
-			if !c.wantImage || gotData == "" {
-				return
-			}
-			// Per-dialect cross-check: the extractor that actually runs for this
-			// shape's call site must agree that it is an image, so the estimate
-			// never diverges from what is uploaded.
-			claudeOK := extractImageFromClaudeBlock(c.part) != nil
-			openaiOK := extractImageFromOpenAIPart(c.part) != nil
-			switch c.dialect {
-			case claude:
-				if !claudeOK {
-					t.Fatalf("classified image but Claude extractor would not pick it up")
-				}
-			case openai:
-				if !openaiOK {
-					t.Fatalf("classified image but OpenAI extractor would not pick it up")
-				}
-			case both:
-				if !claudeOK || !openaiOK {
-					t.Fatalf("classified image but not both extractors agree (claude=%v openai=%v)", claudeOK, openaiOK)
-				}
+
+			_, gotOpenAI := classifyOpenAIImagePart(s.part)
+			wantOpenAI := extractImageFromOpenAIPart(s.part) != nil
+			if gotOpenAI != wantOpenAI {
+				t.Errorf("OpenAI: classifier=%v extractor=%v", gotOpenAI, wantOpenAI)
 			}
 		})
+	}
+}
+
+// TestOutputImageDialectDivergence pins the key asymmetry Codex flagged: an
+// output_image carrying source.data is a real image on the Claude path but text
+// on the OpenAI path, and the two classifiers must reflect that so neither
+// call site diverges from its uploader.
+func TestOutputImageDialectDivergence(t *testing.T) {
+	imgData := makePNGBase64(t, 16, 16)
+	part := map[string]interface{}{
+		"type":   "output_image",
+		"source": map[string]interface{}{"data": imgData},
+	}
+	if _, isImage := classifyClaudeImagePart(part); !isImage {
+		t.Errorf("Claude classifier should treat output_image+source.data as an image (translator does)")
+	}
+	if _, isImage := classifyOpenAIImagePart(part); isImage {
+		t.Errorf("OpenAI classifier must NOT treat output_image as an image (translator forwards it as text)")
 	}
 }
 
@@ -354,7 +330,7 @@ func TestResponsesToolOutputMixedImageAndObject(t *testing.T) {
 		if !ok {
 			t.Fatalf("part is not a map: %T", p)
 		}
-		if _, isImage := classifyImagePart(m); isImage {
+		if _, isImage := classifyOpenAIImagePart(m); isImage {
 			images++
 			continue
 		}

@@ -223,7 +223,7 @@ func stringifyArbitrary(v interface{}) string {
 
 // toolOutputContent normalizes a Responses tool-output value into an
 // OpenAIMessage.Content. When the output is an array containing an image part
-// that the translator can actually upload (classifyImagePart), it returns a
+// that the translator can actually upload (classifyOpenAIImagePart), it returns a
 // normalized []interface{} so downstream conversion and token estimation see
 // the image instead of a base64 blob buried in a JSON string. To avoid changing
 // the old stringify semantics for everything else, non-image parts in that same
@@ -259,16 +259,18 @@ func toolOutputContent(v interface{}) interface{} {
 // array carries at least one uploadable image part, or nil to signal the caller
 // should fall back to plain stringify. Image parts are kept structurally; every
 // other element is folded into a single input_text block so no sibling content
-// is lost (the pre-change behavior stringified the whole value). It keys image
-// recognition off classifyImagePart so it matches exactly what the translator
-// will forward as an image.
+// is lost (the pre-change behavior stringified the whole value). Recognition
+// uses the OpenAI dialect (classifyOpenAIImagePart) because a Responses tool
+// output is converted through the OpenAI -> Kiro path (extractImageFromOpenAIPart);
+// a source-shaped block only Claude could extract must stay stringified so the
+// estimate matches what is actually uploaded.
 func normalizeToolOutputParts(parts []interface{}) []interface{} {
 	hasImage := false
 	var texts []string
 
 	for _, p := range parts {
 		if m, ok := p.(map[string]interface{}); ok {
-			if _, isImage := classifyImagePart(m); isImage {
+			if _, isImage := classifyOpenAIImagePart(m); isImage {
 				hasImage = true
 				continue
 			}
@@ -293,7 +295,7 @@ func normalizeToolOutputParts(parts []interface{}) []interface{} {
 	out := make([]interface{}, 0, len(parts)+1)
 	for _, p := range parts {
 		if m, ok := p.(map[string]interface{}); ok {
-			if _, isImage := classifyImagePart(m); isImage {
+			if _, isImage := classifyOpenAIImagePart(m); isImage {
 				out = append(out, m)
 			}
 		}

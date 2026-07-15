@@ -136,14 +136,13 @@ func estimateClaudeValueTokens(v interface{}) int {
 			}
 		}
 
-		// Any image block (image/image_url/input_image, file/input_file, or a
-		// typeless block carrying an image payload) is costed by its dimensions
-		// rather than letting the base64 fall through to countClaudeJSONTokens
-		// below, which would count the encoded bytes as text and inflate the
-		// estimate by 1-2 orders of magnitude. classifyImagePart mirrors the
-		// translator's recognition so we never diverge from what is actually
-		// uploaded as an image.
-		if data, isImage := classifyImagePart(value); isImage {
+		// Any image block is costed by its dimensions rather than letting the
+		// base64 fall through to countClaudeJSONTokens below, which would count
+		// the encoded bytes as text and inflate the estimate by 1-2 orders of
+		// magnitude. This is the Claude content path, so it uses the Claude
+		// dialect recognizer (mirrors extractImageFromClaudeBlock) — the same
+		// extractor that decides what actually gets uploaded here.
+		if data, isImage := classifyClaudeImagePart(value); isImage {
 			if data == "" {
 				return fallbackImageTokens
 			}
@@ -227,28 +226,36 @@ func estimateOpenAIContentTokens(content interface{}) int {
 	}
 }
 
-// estimateOpenAIPartTokens estimates one OpenAI content part. Image parts are
-// costed by their dimensions via estimateImageTokens (using the shared
-// classifyImagePart oracle so recognition matches the translator); text parts
-// use the character heuristic. Image is checked before text so a single part
-// that carries both a caption field and an image payload is not under-counted
-// as text-only. This deliberately avoids extractOpenAIMessageText, whose
-// JSON-marshal fallback would emit an image part's base64 payload and count it
-// as text.
+// estimateOpenAIPartTokens estimates one OpenAI content part. It uses the
+// OpenAI dialect recognizer (mirrors extractImageFromOpenAIPart), the extractor
+// that runs on this path. Image is costed by dimensions; any text carried on
+// the same part is added so a caption+image part is not lost. This deliberately
+// avoids extractOpenAIMessageText, whose JSON-marshal fallback would emit an
+// image part's base64 payload and count it as text.
 func estimateOpenAIPartTokens(part interface{}) int {
 	m, ok := part.(map[string]interface{})
 	if !ok {
 		return estimateOpenAIContentTokens(part)
 	}
-	if data, isImage := classifyImagePart(m); isImage {
+
+	total := 0
+	imageCounted := false
+	if data, isImage := classifyOpenAIImagePart(m); isImage {
 		if data == "" {
-			return fallbackImageTokens
+			total += fallbackImageTokens
+		} else {
+			total += estimateImageTokens(data)
 		}
-		return estimateImageTokens(data)
+		imageCounted = true
 	}
 	if t, ok := extractOpenAITextPart(m); ok {
-		return estimateApproxTokens(t)
+		total += estimateApproxTokens(t)
+		return total
 	}
+	if imageCounted {
+		return total
+	}
+
 	if nested, ok := m["content"]; ok {
 		return estimateOpenAIContentTokens(nested)
 	}

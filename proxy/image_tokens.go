@@ -121,43 +121,101 @@ func stripDataURLPrefix(data string) string {
 	return s // assume bare base64
 }
 
-// classifyImagePart reports whether a content part is an image the translator
-// would upload as image bytes and, if so, returns the raw candidate payload
-// (data URL or base64) without decoding or validating it. It is the single
-// recognition oracle shared by the token estimator; the rule mirrors the
-// translator's image extractors (extractImageFromClaudeBlock /
-// extractImageFromOpenAIPart), which treat a block as an image only when they
-// can pull a *local* base64/data-URL payload out of it:
+// The token estimator recognizes images through two dialect-specific oracles,
+// one per translator extractor, because the two extractors are NOT equivalent
+// and each estimation call site feeds exactly one of them:
 //
-//   - Explicit text-type blocks are never images.
-//   - output_image is excluded: the translator's extractors reject that type
-//     and forward it as text, so counting it as text here keeps the estimate
-//     consistent with what is actually sent upstream.
-//   - Any other block is an image iff a local base64 payload is extractable.
-//     A remote http(s) URL or a bare file reference carries no local bytes —
-//     the proxy forwards it as text rather than fetching it — so it is not
-//     treated as an image (it is counted as its short text form instead).
+//   - Claude /v1/messages content -> classifyClaudeImagePart (mirrors
+//     extractImageFromClaudeBlock: type-agnostic, reads source.data directly).
+//   - OpenAI /v1/chat/completions and Responses content/tool-output ->
+//     classifyOpenAIImagePart (mirrors extractImageFromOpenAIPart: type-gated,
+//     MIME-gated, rejects output_image and source:{type:"base64"}).
 //
-// Aligning recognition this way prevents both failure modes: an image's base64
-// counted as text (the orders-of-magnitude over-count this change fixes) and a
-// non-image charged image tokens while the translator ships its bytes as text.
-func classifyImagePart(part map[string]interface{}) (data string, isImage bool) {
-	switch typ, _ := part["type"].(string); typ {
-	case "text", "input_text", "output_text", "thinking", "output_image":
-		return "", false
+// Keeping each oracle faithful to the extractor that actually runs for its call
+// site guarantees the estimate matches what is uploaded: an image's base64 is
+// never counted as text (the orders-of-magnitude over-count this change fixes),
+// and a block the translator ships as text is never charged vision tokens.
+// Both return the raw candidate payload (data URL or bare base64) without
+// decoding; a "" data with isImage true means charge fallbackImageTokens.
+
+// classifyClaudeImagePart mirrors extractImageFromClaudeBlock. That extractor is
+// type-agnostic: it reads source.data / source.url directly (no type or MIME
+// gate), then falls through to the OpenAI recognizer, then a top-level data:
+// URL. This intentionally recognizes output_image blocks carrying source.data,
+// which the Claude tool_result path really uploads as images.
+func classifyClaudeImagePart(part map[string]interface{}) (data string, isImage bool) {
+	if source, ok := part["source"].(map[string]interface{}); ok {
+		if d, ok := source["data"].(string); ok && localImagePayload(d) {
+			return d, true
+		}
+		if u, ok := source["url"].(string); ok && isDataURLImage(u) {
+			return u, true
+		}
 	}
-	// Mirror the translator's MIME gate: a block that declares a non-image
-	// content type is forwarded as text, so it must not be classified as an
-	// image here (otherwise we'd charge vision tokens while the base64 is
-	// actually uploaded as text — a large under-count for e.g. PDF file parts).
+	if d, isImg := classifyOpenAIImagePart(part); isImg {
+		return d, true
+	}
+	if d, ok := part["data"].(string); ok && isDataURLImage(d) {
+		return d, true
+	}
+	return "", false
+}
+
+// classifyOpenAIImagePart mirrors extractImageFromOpenAIPart: an explicit,
+// non-whitelisted type is rejected (so output_image is not an image here),
+// file/source are recursed, a declared non-image MIME gates the block out, and
+// the payload is read from url / b64_json / image_url / image_base64 / data.
+// url and image_url accept only data: image URLs (parseDataURL); data accepts a
+// data: URL or bare base64 (parseDataURL-or-parseBase64Image).
+func classifyOpenAIImagePart(part map[string]interface{}) (data string, isImage bool) {
+	if typ, _ := part["type"].(string); typ != "" {
+		switch typ {
+		case "image", "image_url", "input_image", "file", "input_file":
+		default:
+			return "", false
+		}
+	}
+
+	if fileObj, ok := part["file"].(map[string]interface{}); ok {
+		if d, isImg := classifyOpenAIImagePart(fileObj); isImg {
+			return d, true
+		}
+	}
+	if sourceObj, ok := part["source"].(map[string]interface{}); ok {
+		if d, isImg := classifyOpenAIImagePart(sourceObj); isImg {
+			return d, true
+		}
+	}
+
 	if hasNonImageMIME(part) {
 		return "", false
 	}
-	raw := imageDataFromClaudeBlock(part)
-	if raw == "" || stripDataURLPrefix(raw) == "" {
-		return "", false
+
+	if raw, ok := part["url"].(string); ok && isDataURLImage(raw) {
+		return raw, true
 	}
-	return raw, true
+	if raw, ok := part["b64_json"].(string); ok && raw != "" {
+		return raw, true
+	}
+	if raw, ok := part["image_url"]; ok {
+		switch v := raw.(type) {
+		case string:
+			if isDataURLImage(v) {
+				return v, true
+			}
+		case map[string]interface{}:
+			if u, ok := v["url"].(string); ok && isDataURLImage(u) {
+				return u, true
+			}
+		}
+	}
+	if raw, ok := part["image_base64"].(string); ok && raw != "" {
+		return raw, true
+	}
+	if raw, ok := part["data"].(string); ok && localImagePayload(raw) {
+		return raw, true
+	}
+	return "", false
 }
 
 // hasNonImageMIME reports whether the part declares a top-level content type
@@ -175,65 +233,32 @@ func hasNonImageMIME(part map[string]interface{}) bool {
 	return false
 }
 
-// imageDataFromClaudeBlock returns the raw image payload string (data URL or
-// bare base64) from a Claude-style image block, without validating or decoding
-// it. It mirrors the key lookup in extractImageFromClaudeBlock but skips the
-// full base64 validation, since the token estimator only needs a cheap size
-// probe. Empty string means no usable payload was found.
-func imageDataFromClaudeBlock(block map[string]interface{}) string {
-	if source, ok := block["source"].(map[string]interface{}); ok {
-		if data, ok := source["data"].(string); ok && data != "" {
-			return data
-		}
-		if url, ok := source["url"].(string); ok && url != "" {
-			return url
-		}
+// localImagePayload reports whether s is a locally-measurable image payload the
+// translator would accept via parseDataURL-or-parseBase64Image: a data:image/
+// URL, or a bare (non-URL) base64 string. A remote http(s) URL carries no local
+// bytes and a non-image data: URL (e.g. a PDF) is rejected — matching
+// parseBase64Image failing to decode the full data: string.
+func localImagePayload(s string) bool {
+	t := strings.TrimSpace(s)
+	if t == "" {
+		return false
 	}
-	if data, ok := block["data"].(string); ok && data != "" {
-		return data
+	if strings.HasPrefix(t, "http://") || strings.HasPrefix(t, "https://") {
+		return false
 	}
-	return imageDataFromOpenAIPart(block)
+	if strings.HasPrefix(strings.ToLower(t), "data:") {
+		return isDataURLImage(t)
+	}
+	return true // bare base64
 }
 
-// imageDataFromOpenAIPart returns the raw image payload string from an
-// OpenAI-style content part, without the full base64 validation that
-// extractImageFromOpenAIPart performs. It is the estimator-path counterpart of
-// that function: a cheap candidate-string lookup rather than a decode. Empty
-// string means the part carries no image payload.
-func imageDataFromOpenAIPart(part map[string]interface{}) string {
-	if fileObj, ok := part["file"].(map[string]interface{}); ok {
-		if s := imageDataFromOpenAIPart(fileObj); s != "" {
-			return s
-		}
+// isDataURLImage reports whether s is a data:image/ URL with a base64 payload,
+// mirroring parseDataURL (which rejects remote URLs, bare base64, and non-image
+// data URLs for the url/image_url fields).
+func isDataURLImage(s string) bool {
+	t := strings.TrimSpace(s)
+	if !strings.HasPrefix(strings.ToLower(t), "data:image/") {
+		return false
 	}
-	if sourceObj, ok := part["source"].(map[string]interface{}); ok {
-		if s := imageDataFromOpenAIPart(sourceObj); s != "" {
-			return s
-		}
-	}
-	if raw, ok := part["url"].(string); ok && raw != "" {
-		return raw
-	}
-	if raw, ok := part["b64_json"].(string); ok && raw != "" {
-		return raw
-	}
-	if raw, ok := part["image_url"]; ok {
-		switch v := raw.(type) {
-		case string:
-			if v != "" {
-				return v
-			}
-		case map[string]interface{}:
-			if u, ok := v["url"].(string); ok && u != "" {
-				return u
-			}
-		}
-	}
-	if raw, ok := part["image_base64"].(string); ok && raw != "" {
-		return raw
-	}
-	if raw, ok := part["data"].(string); ok && raw != "" {
-		return raw
-	}
-	return ""
+	return stripDataURLPrefix(t) != ""
 }
