@@ -256,8 +256,15 @@ func estimateOpenAIPartTokens(part interface{}) int {
 		return total
 	}
 
+	// A non-image, non-text part with nested content is estimated from that
+	// content. But if the nested estimate is 0 (content nil/""/[] or absent),
+	// fall back to marshaling the whole object — matching the pre-change
+	// behavior (estimateJSONTokens) so a structured part is never silently
+	// counted as 0 tokens.
 	if nested, ok := m["content"]; ok {
-		return estimateOpenAIContentTokens(nested)
+		if n := estimateOpenAIContentTokens(nested); n > 0 {
+			return n
+		}
 	}
 	return estimateJSONTokens(m)
 }

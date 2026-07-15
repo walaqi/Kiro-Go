@@ -204,11 +204,15 @@ func TestToolOutputContentStringifiesNonImage(t *testing.T) {
 }
 
 // TestClassifiersMatchTranslatorExtractors asserts each dialect recognizer
-// agrees EXACTLY (image-or-not) with the translator extractor that actually
-// runs on its call site: classifyClaudeImagePart vs extractImageFromClaudeBlock,
+// agrees with the translator extractor that actually runs on its call site for
+// well-formed inputs: classifyClaudeImagePart vs extractImageFromClaudeBlock,
 // classifyOpenAIImagePart vs extractImageFromOpenAIPart. This is the invariant
 // that keeps the estimate consistent with what is uploaded, and it covers the
 // forms where the two extractors diverge (source-shaped base64, output_image).
+// Note: this is legal-input equivalence, not equivalence over arbitrary bytes —
+// the recognizers do a cheap shape/local-payload check while the extractors
+// fully validate base64, so a corrupt/incomplete payload can be classified as
+// an image yet fail extraction. That is the deliberate no-full-decode tradeoff.
 func TestClassifiersMatchTranslatorExtractors(t *testing.T) {
 	imgData := makePNGBase64(t, 16, 16)
 	dataURL := "data:image/png;base64," + imgData
@@ -244,6 +248,9 @@ func TestClassifiersMatchTranslatorExtractors(t *testing.T) {
 		}},
 		{"non-image mime file", map[string]interface{}{
 			"type": "file", "mime_type": "application/pdf", "data": dataURL,
+		}},
+		{"empty mime gates out", map[string]interface{}{
+			"type": "image", "mime": "", "image_url": map[string]interface{}{"url": dataURL},
 		}},
 		{"plain text", map[string]interface{}{"type": "text", "text": "hello"}},
 		{"b64_json", map[string]interface{}{"type": "image", "b64_json": imgData}},
@@ -365,5 +372,24 @@ func TestResponsesToolOutputOutputImageStringifies(t *testing.T) {
 	}
 	if _, ok := out.(string); !ok {
 		t.Fatalf("output_image-only output should stringify, got %T (%v)", out, out)
+	}
+}
+
+// TestOpenAIPartEmptyContentNotZero covers Codex round-4 finding b: a
+// non-image, non-text part whose nested content estimates to 0 (nil/""/[] or
+// absent) must fall back to marshaling the whole object, not silently count as
+// 0 tokens — matching the pre-change estimateJSONTokens behavior.
+func TestOpenAIPartEmptyContentNotZero(t *testing.T) {
+	cases := []interface{}{
+		map[string]interface{}{"type": "tool_use", "id": "call_123", "name": "search", "content": nil},
+		map[string]interface{}{"type": "tool_use", "id": "call_123", "content": ""},
+		map[string]interface{}{"type": "custom_block", "id": "abc", "content": []interface{}{}},
+		map[string]interface{}{"foo": "bar", "baz": 42}, // no content key at all
+	}
+	for i, part := range cases {
+		got := estimateOpenAIPartTokens(part)
+		if got <= 0 {
+			t.Errorf("case %d: got %d tokens, want > 0 (structured part must not collapse to 0)", i, got)
+		}
 	}
 }

@@ -218,13 +218,14 @@ func classifyOpenAIImagePart(part map[string]interface{}) (data string, isImage 
 	return "", false
 }
 
-// hasNonImageMIME reports whether the part declares a top-level content type
-// that is present but not image/*. It matches the gate in
-// extractImageFromOpenAIPart so recognition stays aligned with what the
-// translator actually uploads as an image.
+// hasNonImageMIME reports whether the part declares a top-level content-type
+// field that is present as a string but not image/*. It matches the gate in
+// extractImageFromOpenAIPart exactly: that gate rejects the block when the
+// field is present and lacks an "image/" prefix, which includes the empty
+// string (an empty MIME is not image/*), so this must not skip empty values.
 func hasNonImageMIME(part map[string]interface{}) bool {
 	for _, key := range []string{"mime", "media_type", "mime_type"} {
-		if raw, ok := part[key].(string); ok && raw != "" {
+		if raw, ok := part[key].(string); ok {
 			if !strings.HasPrefix(strings.ToLower(raw), "image/") {
 				return true
 			}
