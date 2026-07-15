@@ -136,6 +136,19 @@ func estimateClaudeValueTokens(v interface{}) int {
 			}
 		}
 
+		// Any image block is costed by its dimensions rather than letting the
+		// base64 fall through to countClaudeJSONTokens below, which would count
+		// the encoded bytes as text and inflate the estimate by 1-2 orders of
+		// magnitude. This is the Claude content path, so it uses the Claude
+		// dialect recognizer (mirrors extractImageFromClaudeBlock) — the same
+		// extractor that decides what actually gets uploaded here.
+		if data, isImage := classifyClaudeImagePart(value); isImage {
+			if data == "" {
+				return fallbackImageTokens
+			}
+			return estimateImageTokens(data)
+		}
+
 		total := 0
 		if text, ok := value["text"].(string); ok {
 			total += countTokens(text)
@@ -200,13 +213,60 @@ func estimateOpenAIContentTokens(content interface{}) int {
 		return 0
 	case string:
 		return estimateApproxTokens(value)
-	default:
-		text := extractOpenAIMessageText(value)
-		if text != "" {
-			return estimateApproxTokens(text)
+	case []interface{}:
+		total := 0
+		for _, part := range value {
+			total += estimateOpenAIPartTokens(part)
 		}
+		return total
+	case map[string]interface{}:
+		return estimateOpenAIPartTokens(value)
+	default:
 		return estimateJSONTokens(value)
 	}
+}
+
+// estimateOpenAIPartTokens estimates one OpenAI content part. It uses the
+// OpenAI dialect recognizer (mirrors extractImageFromOpenAIPart), the extractor
+// that runs on this path. Image is costed by dimensions; any text carried on
+// the same part is added so a caption+image part is not lost. This deliberately
+// avoids extractOpenAIMessageText, whose JSON-marshal fallback would emit an
+// image part's base64 payload and count it as text.
+func estimateOpenAIPartTokens(part interface{}) int {
+	m, ok := part.(map[string]interface{})
+	if !ok {
+		return estimateOpenAIContentTokens(part)
+	}
+
+	total := 0
+	imageCounted := false
+	if data, isImage := classifyOpenAIImagePart(m); isImage {
+		if data == "" {
+			total += fallbackImageTokens
+		} else {
+			total += estimateImageTokens(data)
+		}
+		imageCounted = true
+	}
+	if t, ok := extractOpenAITextPart(m); ok {
+		total += estimateApproxTokens(t)
+		return total
+	}
+	if imageCounted {
+		return total
+	}
+
+	// A non-image, non-text part with nested content is estimated from that
+	// content. But if the nested estimate is 0 (content nil/""/[] or absent),
+	// fall back to marshaling the whole object — matching the pre-change
+	// behavior (estimateJSONTokens) so a structured part is never silently
+	// counted as 0 tokens.
+	if nested, ok := m["content"]; ok {
+		if n := estimateOpenAIContentTokens(nested); n > 0 {
+			return n
+		}
+	}
+	return estimateJSONTokens(m)
 }
 
 func estimateOpenAIOutputTokens(content, reasoningContent string, toolUses []KiroToolUse) int {
